@@ -15,6 +15,8 @@ use serde_json;
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
 static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
 
+static atServerIdx: Lazy<Mutex<[u64; 2]>> = Lazy::new(|| Mutex::new([0u64, 0u64]));
+
 #[derive(Deserialize)]
 struct IpStruct([u64; 4], u64);
 
@@ -38,6 +40,7 @@ struct Config {
 enum ErrorTypes {
     UpstreamServerFailed,
     TimeoutError,
+    HealthyServerNotFound,
 }
 
 async fn proxy(
@@ -46,8 +49,13 @@ async fn proxy(
     origin_ip: String,
     timeout_dur: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
+
+    if let Err(err) = updateTARGET().await{
+        return Err(err)
+    }
+
     let guard = TARGET.lock().await; 
-    let target_arc = (*guard).clone().unwrap();
+    let target_arc = guard.clone().unwrap();
     let mut target = target_arc.lock().await; 
 
     let new_uri = format!(
@@ -99,7 +107,7 @@ async fn main() {
         *TARGET.lock().await = Some(server);
     }
 
-    let timeout_dur = &CONFIG.lock().await.timeout_dur;
+    let timeout_dur = CONFIG.lock().await.timeout_dur;
     let addr = ([127, 0, 0, 1], 3000).into();
     let client = Arc::new(Client::new());
 
@@ -180,14 +188,85 @@ fn load_from_file_depr(file_path: &str) -> anyhow::Result<Config> {
     Ok(deserialized_config)
 }
 
+async fn updateTARGET() -> anyhow::Result<()> {
+
+    let target_arc = {
+        let guard = TARGET.lock().await; 
+        guard.clone().unwrap()
+    };
+    let mut target = target_arc.lock().await;  
+    println!("finished mutex locking TARGET");
+
+    let mut config = CONFIG.lock().await;
+
+    println!("config locked");
+
+    let mut at_server_idx = atServerIdx.lock().await;
+    println!("server idx locked");
+
+    //next server IDEALLY
+    if at_server_idx[1] == target.weight{ //next server needed
+        at_server_idx[1] = 0;
+        if at_server_idx[0] == config.servers.len() as u64 - 1{ //at last server in list
+            at_server_idx[0] = 0;
+        }else{
+            at_server_idx[0] += 1;
+        }
+    }else{
+        at_server_idx[1] += 1;
+    }
+
+    println!("{:?}", at_server_idx); 
+
+    drop(target);
+
+    let mut foundHealthy = false;
+    let mut serversChecked = 0;
+
+    while !foundHealthy{
+
+        let server_arc = config.servers[at_server_idx[0] as usize].clone();
+        println!("i hate my life");
+        let server_guard = server_arc.lock().await;
+        let is_active_val = server_guard.is_active.clone();
+        println!("YES OMFG");
+
+        if  is_active_val == true{
+            println!("No lock");
+            foundHealthy = true;
+            break;
+        }else{
+            if at_server_idx[0] == config.servers.len() as u64 - 1{ //at last server in list
+                at_server_idx[0] = 0;
+            }else{
+                at_server_idx[0] += 1;
+            }
+        }
+        serversChecked += 1;
+        if serversChecked == config.servers.len() {
+            return Err(anyhow::Error::msg(format_error_type(ErrorTypes::HealthyServerNotFound)))
+        }
+    }
+
+    println!("Healthy server found");
+
+    let target_server = config.servers[at_server_idx[0] as usize].clone();
+    drop(config);
+
+    *TARGET.lock().await = Some(target_server);
+
+    Ok(())
+}
+
 //Nextt => for load_balancer
 // 
-//make at server: idx static and count static 
-//in function, which u call before accessing target,
+//make at server: idx static and count static XXX
+//in function, which u call before accessing target, XXX
 //...
-//
-//make weighted - cont of above tsk
+//find active, return err if no XXX
+//Handle that err XXX
+//make weighted 
 //
 //health checks
 //
-//metrics
+//metrics 
