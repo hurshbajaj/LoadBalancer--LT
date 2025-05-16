@@ -1,0 +1,13 @@
+{
+    "host": [[127, 0, 0, 1], 3000],
+    "timeout_dur": 5,
+    "servers": [
+        {
+            "ip": "http://localhost:5000",
+            "weight": 1,
+            "is_active": true,
+            "res_time": 0 
+        } 
+    ]
+}
+
