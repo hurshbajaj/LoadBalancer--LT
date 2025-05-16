@@ -40,7 +40,7 @@ struct Config {
 enum ErrorTypes {
     UpstreamServerFailed,
     TimeoutError,
-    HealthyServerNotFound,
+    NoHealthyServerFound,
 }
 
 async fn proxy(
@@ -243,7 +243,7 @@ async fn updateTARGET() -> anyhow::Result<()> {
         }
         serversChecked += 1;
         if serversChecked == config.servers.len() {
-            return Err(anyhow::Error::msg(format_error_type(ErrorTypes::HealthyServerNotFound)))
+            return Err(anyhow::Error::msg(format_error_type(ErrorTypes::NoHealthyServerFound)))
         }
     }
 
