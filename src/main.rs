@@ -120,7 +120,6 @@ async fn main() {
             Ok::<_, anyhow::Error>(service_fn(move |req| {
                 let client = client.clone();
                 let remote = remote_addr.clone();
-                //let timeout_dur = timeout_dur.clone();
 
                 async move {
                     match proxy(req, client, remote, timeout_dur.clone()).await {
