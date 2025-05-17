@@ -371,18 +371,4 @@ async fn reorder() -> anyhow::Result<()> {
 }
 
 
-//Nextt => for load_balancer XXX
-// 
-//make at server: idx static and count static XXX
-//in function, which u call before accessing target, XXX
-//...
-//find active, return err if no XXX
-//Handle that err XXX
-//change weights (in health checks) XXX set to 10 for default ; err handling not worth it 10 being
-//good mark as this is a value which if not handled correctly will return err, not propogate~~~
-//
-//health checks XXX
-//
-//reorder servers list according to weight, reset at server idx to 0, 0 XXX
-//
 //metrics TODO
