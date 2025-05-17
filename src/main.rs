@@ -6,6 +6,7 @@ use tokio::time::timeout;
 use std::fs::File;
 use std::io::Read;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 use anyhow::{self, Context};
 use once_cell::sync::Lazy;
@@ -17,7 +18,7 @@ static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./c
 
 static atServerIdx: Lazy<Mutex<[u64; 2]>> = Lazy::new(|| Mutex::new([0u64, 0u64]));
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct IpStruct([u64; 4], u64);
 
 #[derive(Deserialize, Clone)]
@@ -26,12 +27,17 @@ struct Server {
     weight: u64,
     is_active: bool,
     res_time: u64,
+
+    strict_timeout: bool,
+    timeout_tick: u16,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Config {
     host: IpStruct,
     timeout_dur: u64,
+    health_check: u64,
+    health_check_path: String,
     #[serde(skip)]
     servers: Vec<Arc<Mutex<Server>>>,
 }
@@ -41,6 +47,7 @@ enum ErrorTypes {
     UpstreamServerFailed,
     TimeoutError,
     NoHealthyServerFound,
+    HealthCheckFailed,
 }
 
 async fn proxy(
@@ -87,12 +94,53 @@ async fn proxy(
     match timeout_result {
         Ok(result) => match result {
             Ok(response) => {
-                target.res_time = start.elapsed().as_millis() as u64;
+                target.res_time = ( (start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
                 Ok(response)
             }
-            Err(_) => Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed))),
+            //this can be intended by the server, dont make it non active
+            Err(_) => Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed))), 
         },
         Err(_) => {
+            if target.strict_timeout{
+                target.is_active = false;
+            } else{
+                target.timeout_tick += 1;
+                if target.timeout_tick >= 3{
+                    target.is_active = false;
+                }
+            }
+            Err(anyhow::Error::msg(format_error_type(ErrorTypes::TimeoutError)))
+        }
+    }
+}
+
+
+async fn health_check_proxy(
+    client: Arc<Client<HttpConnector>>,
+    timeout_dur: u64,
+    server: Arc<Mutex<Server>>,
+    health_check_path: String
+) -> Result<Response<Body>, anyhow::Error> {
+
+    let target_arc = server.clone();
+    let mut target = target_arc.lock().await; 
+
+    let req = Request::builder().uri(format!("{}{}", target.ip.clone(), health_check_path)).method("GET").body(Body::empty()).unwrap();
+
+    let start = Instant::now();
+    let timeout_result = timeout(Duration::from_secs(timeout_dur), client.request(req)).await;
+
+    match timeout_result {
+        Ok(result) => match result {
+            Ok(response) => {
+                target.is_active = true;
+                Ok(response)
+            }
+            
+            Err(_) => {target.is_active = false; Err(anyhow::Error::msg(format_error_type(ErrorTypes::HealthCheckFailed)))}, 
+        },
+        Err(_) => {
+            
             target.is_active = false;
             Err(anyhow::Error::msg(format_error_type(ErrorTypes::TimeoutError)))
         }
@@ -141,9 +189,45 @@ async fn main() {
 
     println!("Reverse proxy running on http://{}", addr);
 
+
+    
+    let healthCheck = tokio::spawn(async move {
+        println!("thread!");
+        
+        let client = Arc::new(Client::new());
+        let config_guard = CONFIG.lock().await;
+        let timeout_dur = config_guard.timeout_dur;
+
+        let ip = config_guard.host.clone();
+
+        let uri = format!("http://{}.{}.{}.{}:{}/", ip.0[0], ip.0[1], ip.0[2], ip.0[3], ip.1);
+
+        let servers = config_guard.servers.clone();
+
+        let health_check = config_guard.health_check;
+
+        let health_check_path = config_guard.health_check_path.clone();
+        drop(config_guard);
+
+        loop{
+            tokio::time::sleep(Duration::from_secs(health_check));
+            println!("shud send health chek now");
+
+            for server in servers.clone(){
+                health_check_proxy(client.clone(), timeout_dur.clone(), server, health_check_path.clone()).await;
+
+                //change weight
+
+            }
+
+            //reorder
+        }
+    });
+
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
     }
+
 }
 
 fn format_error_type(err: ErrorTypes) -> String {
@@ -159,6 +243,8 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
     struct RawConfig {
         host: IpStruct,
         timeout_dur: u64,
+        health_check: u64,
+        health_check_path: String,
         servers: Vec<Server>,
     }
 
@@ -174,17 +260,10 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
     Ok(Config {
         host: raw_config.host,
         timeout_dur: raw_config.timeout_dur,
+        health_check: raw_config.health_check,
+        health_check_path: raw_config.health_check_path,
         servers,
     })
-}
-
-fn load_from_file_depr(file_path: &str) -> anyhow::Result<Config> {
-    let mut file = File::open(file_path).context(format!("Failed to open file: {}", file_path))?;
-    let mut json_data = String::new();
-    file.read_to_string(&mut json_data).context("Failed to read file")?;
-    let deserialized_config: Config =
-        serde_json::from_str(&json_data).context("Failed to deserialize JSON from file")?;
-    Ok(deserialized_config)
 }
 
 async fn updateTARGET() -> anyhow::Result<()> {
@@ -204,7 +283,7 @@ async fn updateTARGET() -> anyhow::Result<()> {
     println!("server idx locked");
 
     //next server IDEALLY
-    if at_server_idx[1] == target.weight{ //next server needed
+    if at_server_idx[1] >= target.weight{ //next server needed
         at_server_idx[1] = 0;
         if at_server_idx[0] == config.servers.len() as u64 - 1{ //at last server in list
             at_server_idx[0] = 0;
@@ -264,8 +343,10 @@ async fn updateTARGET() -> anyhow::Result<()> {
 //...
 //find active, return err if no XXX
 //Handle that err XXX
-//make weighted 
+//change weights (in health checks) 
 //
 //health checks
+//
+//reorder servers ist according to weight, reset at server idx to 0, 0
 //
 //metrics 
