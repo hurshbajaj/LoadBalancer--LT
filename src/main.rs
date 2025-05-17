@@ -15,6 +15,7 @@ use serde_json;
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
 static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
+static max_res: Lazy<Mutex<u64>> =  Lazy::new(|| Mutex::new(0u64));
 
 static atServerIdx: Lazy<Mutex<[u64; 2]>> = Lazy::new(|| Mutex::new([0u64, 0u64]));
 
@@ -94,6 +95,10 @@ async fn proxy(
     match timeout_result {
         Ok(result) => match result {
             Ok(response) => {
+                let mut max = max_res.lock().await;
+                if start.elapsed().as_millis() as u64 > *max as u64{
+                    *max = start.elapsed().as_millis() as u64;
+                }
                 target.res_time = ( (start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
                 Ok(response)
             }
@@ -127,13 +132,16 @@ async fn health_check_proxy(
 
     let req = Request::builder().uri(format!("{}{}", target.ip.clone(), health_check_path)).method("GET").body(Body::empty()).unwrap();
 
-    let start = Instant::now();
     let timeout_result = timeout(Duration::from_secs(timeout_dur), client.request(req)).await;
 
     match timeout_result {
         Ok(result) => match result {
             Ok(response) => {
                 target.is_active = true;
+                if *max_res.lock().await != 0{
+                    target.weight = ( ( 1-(target.res_time / *(max_res.lock().await) as u64 ) ) * 10 ) as u64;
+                }
+                println!("weight is {:?}", target.weight);
                 Ok(response)
             }
             
@@ -210,17 +218,17 @@ async fn main() {
         drop(config_guard);
 
         loop{
-            tokio::time::sleep(Duration::from_secs(health_check));
+            tokio::time::sleep(Duration::from_secs(health_check)).await;
             println!("shud send health chek now");
 
-            for server in servers.clone(){
+            let mut Servers = servers.clone();
+
+            for server in Servers{
                 health_check_proxy(client.clone(), timeout_dur.clone(), server, health_check_path.clone()).await;
-
-                //change weight
-
             }
 
-            //reorder
+            reorder().await.unwrap();
+
         }
     });
 
@@ -336,17 +344,45 @@ async fn updateTARGET() -> anyhow::Result<()> {
     Ok(())
 }
 
-//Nextt => for load_balancer
+async fn reorder() -> anyhow::Result<()> {
+    let mut config = CONFIG.lock().await;
+
+    let mut weighted_servers: Vec<(u64, Arc<Mutex<Server>>)> = Vec::new();
+
+    for server_arc in &config.servers {
+        let server = server_arc.lock().await;
+        if server.is_active {
+            weighted_servers.push((server.weight, server_arc.clone()));
+        } else {
+            weighted_servers.push((0, server_arc.clone()));
+        }
+    }
+
+    weighted_servers.sort_by(|a, b| b.0.cmp(&a.0));
+
+    config.servers = weighted_servers.into_iter().map(|(_, srvr)| srvr).collect();
+
+    drop(config);
+
+    let mut at_server_idx = atServerIdx.lock().await;
+    *at_server_idx = [0, 0];
+
+    Ok(())
+}
+
+
+//Nextt => for load_balancer XXX
 // 
 //make at server: idx static and count static XXX
 //in function, which u call before accessing target, XXX
 //...
 //find active, return err if no XXX
 //Handle that err XXX
-//change weights (in health checks) 
+//change weights (in health checks) XXX set to 10 for default ; err handling not worth it 10 being
+//good mark as this is a value which if not handled correctly will return err, not propogate~~~
 //
-//health checks
+//health checks XXX
 //
-//reorder servers ist according to weight, reset at server idx to 0, 0
+//reorder servers list according to weight, reset at server idx to 0, 0 XXX
 //
-//metrics 
+//metrics TODO

@@ -12,6 +12,15 @@
 
             "strict_timeout": false,
             "timeout_tick": 0
+        },
+        {
+            "ip": "http://localhost:5001",
+            "weight": 1,
+            "is_active": true,
+            "res_time": 0, 
+
+            "strict_timeout": false,
+            "timeout_tick": 0
         } 
     ]
 }
