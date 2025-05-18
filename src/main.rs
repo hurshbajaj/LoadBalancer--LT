@@ -1,17 +1,13 @@
-use hyper::client::HttpConnector;
-use hyper::{Client, Request, Response, Body, Server as HyperServer, Uri};
-use hyper::service::{make_service_fn, service_fn};
-use tokio::sync::Mutex; 
-use tokio::time::timeout;
-use std::fs::File;
-use std::io::Read;
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::{fs::File, io::Read, str::FromStr, sync::Arc, thread, time::{Duration, Instant}};
+use tokio::{sync::Mutex, time::timeout};
+use hyper::{
+    body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
+};
 use anyhow::{self, Context};
 use once_cell::sync::Lazy;
-use serde::Deserialize;
+use serde::{Deserialize};
 use serde_json;
+
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
 static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
@@ -52,69 +48,79 @@ enum ErrorTypes {
 }
 
 async fn proxy(
-    req: Request<Body>,
+    mut req: Request<Body>,
     client: Arc<Client<HttpConnector>>,
     origin_ip: String,
     timeout_dur: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
 
-    if let Err(err) = updateTARGET().await{
-        return Err(err)
-    }
+    let mut count = -1;
 
-    let guard = TARGET.lock().await; 
-    let target_arc = guard.clone().unwrap();
-    let mut target = target_arc.lock().await; 
+    loop{
+        count += 1;
+        let req_clone: Request<Body>;
+        (req_clone, req) = clone_request(req).await.unwrap();
 
-    let new_uri = format!(
-        "{}{}",
-        target.ip,
-        req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/")
-    )
-    .parse::<Uri>()
-    .expect("Failed to parse URI");
+        if let Err(err) = updateTARGET().await{
+            return Err(err)
+        }
 
-    let mut proxied_req = Request::builder()
-        .method(req.method())
-        .uri(new_uri)
-        .version(req.version());
+        let guard = TARGET.lock().await; 
+        let target_arc = guard.clone().unwrap();
+        let mut target = target_arc.lock().await; 
 
-    for (key, value) in req.headers() {
-        proxied_req = proxied_req.header(key, value);
-    }
+        let new_uri = format!(
+            "{}{}",
+            target.ip,
+            req_clone.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/")
+        )
+        .parse::<Uri>()
+        .expect("Failed to parse URI");
 
-    proxied_req = proxied_req.header("X-Forwarded-For", origin_ip);
+        let mut proxied_req = Request::builder()
+            .method(req_clone.method())
+            .uri(new_uri)
+            .version(req_clone.version());
 
-    let proxied_req = proxied_req
-        .body(req.into_body())
-        .expect("Failed to build request");
+        for (key, value) in req_clone.headers() {
+            proxied_req = proxied_req.header(key, value);
+        }
 
-    let start = Instant::now();
-    let timeout_result = timeout(Duration::from_secs(timeout_dur), client.request(proxied_req)).await;
+        proxied_req = proxied_req.header("X-Forwarded-For", origin_ip.clone());
 
-    match timeout_result {
-        Ok(result) => match result {
-            Ok(response) => {
-                let mut max = max_res.lock().await;
-                if start.elapsed().as_millis() as u64 > *max as u64{
-                    *max = start.elapsed().as_millis() as u64;
+        let proxied_req = proxied_req
+            .body(req_clone.into_body())
+            .expect("Failed to build request");
+
+        let start = Instant::now();
+        let timeout_result = timeout(Duration::from_secs(timeout_dur), client.request(proxied_req)).await;
+
+        match timeout_result {
+            Ok(result) => match result {
+                Ok(response) => {
+                    let mut max = max_res.lock().await;
+                    if start.elapsed().as_millis() as u64 > *max as u64{
+                        *max = start.elapsed().as_millis() as u64;
+                    }
+                    target.res_time = ( (start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
+                    return Ok(response)
                 }
-                target.res_time = ( (start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
-                Ok(response)
-            }
-            //this can be intended by the server, dont make it non active
-            Err(_) => Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed))), 
-        },
-        Err(_) => {
-            if target.strict_timeout{
-                target.is_active = false;
-            } else{
-                target.timeout_tick += 1;
-                if target.timeout_tick >= 3{
+                //this can be intended by the server, dont make it non active
+                Err(_) => {if count >= 1{return Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed)))}}, 
+            },
+            Err(_) => {
+                if target.strict_timeout{
                     target.is_active = false;
+                } else{
+                    target.timeout_tick += 1;
+                    if target.timeout_tick >= 3{
+                        target.is_active = false;
+                    }
+                }
+                if count >= 1{
+                    return Err(anyhow::Error::msg(format_error_type(ErrorTypes::TimeoutError)))
                 }
             }
-            Err(anyhow::Error::msg(format_error_type(ErrorTypes::TimeoutError)))
         }
     }
 }
@@ -370,5 +376,39 @@ async fn reorder() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn clone_request(req: Request<Body>) -> Result<(Request<Body>, Request<Body>), hyper::Error> {
+
+    let (parts, body) = req.into_parts();
+    let bytes = to_bytes(body).await.unwrap();
+
+    let mut req1 = Request::builder()
+        .method(parts.method.clone())
+        .uri(parts.uri.clone())
+        .version(parts.version.clone())
+        .body(Body::from(bytes.clone()))
+        .unwrap();
+
+    let mut req2 = Request::builder()
+        .method(parts.method.clone())
+        .uri(parts.uri.clone())
+        .version(parts.version.clone())
+        .body(Body::from(bytes.clone()))
+        .unwrap();
+
+    for (key, value) in parts.headers.clone() {
+        let header_name = HeaderName::from_str(key.unwrap().to_string().as_str()).unwrap();
+        let header_value = HeaderValue::from_str(value.to_str().unwrap()).unwrap();
+        req1.headers_mut().insert(
+            header_name.clone(),
+            header_value.clone(),
+        );
+        req2.headers_mut().insert(
+            header_name,
+            header_value,
+        );
+    }
+
+    Ok((req1, req2))
+} 
 
 //metrics TODO
