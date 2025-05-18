@@ -13,6 +13,7 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - Safe Request Handling with Arc /  Async Mutex
 - Custom Reverse Proxy
 - Inactive Servers due to Timeout Window revaluation
+- Failovers
 <hr>
 
 *1.0* 
