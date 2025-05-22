@@ -1,9 +1,14 @@
 {
     "host": [[127, 0, 0, 1], 3000],
+
     "timeout_dur": 2,
+
     "health_check": 5,
+
     "health_check_path": "/",
+
     "servers": [
+
         {
             "ip": "http://localhost:5000",
             "weight": 1,
@@ -22,6 +27,7 @@
             "strict_timeout": false,
             "timeout_tick": 0
         } 
-    ]
-}
 
+    ]
+
+}

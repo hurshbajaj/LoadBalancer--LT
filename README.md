@@ -17,6 +17,4 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 <hr>
 
 *1.0* 
-Next step: Adding metrics  (Many being kept track of already, simply need to be provided a TUI )
-
 Current logs undescriptive & improper, solely meant for debugging.

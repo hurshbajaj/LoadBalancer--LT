@@ -8,6 +8,7 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize};
 use serde_json;
 
+mod CLIclient;
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
 static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
@@ -55,6 +56,9 @@ async fn proxy(
 ) -> Result<Response<Body>, anyhow::Error> {
 
     let mut count = -1;
+    let mut X = CLIclient::reqs.write().await;
+    *X += 1u64;
+    drop(X);
 
     loop{
         count += 1;
@@ -147,7 +151,6 @@ async fn health_check_proxy(
                 if *max_res.lock().await != 0{
                     target.weight = ( ( 1-(target.res_time / *(max_res.lock().await) as u64 ) ) * 10 ) as u64;
                 }
-                println!("weight is {:?}", target.weight);
                 Ok(response)
             }
             
@@ -185,9 +188,11 @@ async fn main() {
 
                 async move {
                     match proxy(req, client, remote, timeout_dur.clone()).await {
-                        Ok(response) => Ok::<Response<Body>, anyhow::Error>(response),
+                        Ok(response) => {
+                            Ok::<Response<Body>, anyhow::Error>(response)
+                        },
                         Err(err) => {
-                            println!("Proxy error: {:?}", err);
+                            //println!("Proxy error: {:?}", err); FIXME
                             Ok(Response::builder()
                                 .status(hyper::StatusCode::BAD_GATEWAY)
                                 .body(Body::from(err.to_string()))
@@ -201,12 +206,7 @@ async fn main() {
 
     let server = HyperServer::bind(&addr).serve(make_svc);
 
-    println!("Reverse proxy running on http://{}", addr);
-
-
-    
     let healthCheck = tokio::spawn(async move {
-        println!("thread!");
         
         let client = Arc::new(Client::new());
         let config_guard = CONFIG.lock().await;
@@ -225,7 +225,6 @@ async fn main() {
 
         loop{
             tokio::time::sleep(Duration::from_secs(health_check)).await;
-            println!("shud send health chek now");
 
             let mut Servers = servers.clone();
 
@@ -237,6 +236,13 @@ async fn main() {
 
         }
     });
+
+   let clientRun = tokio::spawn(async {
+
+        //cli
+        CLIclient::establish().await;
+
+   }); 
 
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
@@ -287,14 +293,10 @@ async fn updateTARGET() -> anyhow::Result<()> {
         guard.clone().unwrap()
     };
     let mut target = target_arc.lock().await;  
-    println!("finished mutex locking TARGET");
 
     let mut config = CONFIG.lock().await;
 
-    println!("config locked");
-
     let mut at_server_idx = atServerIdx.lock().await;
-    println!("server idx locked");
 
     //next server IDEALLY
     if at_server_idx[1] >= target.weight{ //next server needed
@@ -308,8 +310,6 @@ async fn updateTARGET() -> anyhow::Result<()> {
         at_server_idx[1] += 1;
     }
 
-    println!("{:?}", at_server_idx); 
-
     drop(target);
 
     let mut foundHealthy = false;
@@ -318,13 +318,10 @@ async fn updateTARGET() -> anyhow::Result<()> {
     while !foundHealthy{
 
         let server_arc = config.servers[at_server_idx[0] as usize].clone();
-        println!("i hate my life");
         let server_guard = server_arc.lock().await;
         let is_active_val = server_guard.is_active.clone();
-        println!("YES OMFG");
 
         if  is_active_val == true{
-            println!("No lock");
             foundHealthy = true;
             break;
         }else{
@@ -339,8 +336,6 @@ async fn updateTARGET() -> anyhow::Result<()> {
             return Err(anyhow::Error::msg(format_error_type(ErrorTypes::NoHealthyServerFound)))
         }
     }
-
-    println!("Healthy server found");
 
     let target_server = config.servers[at_server_idx[0] as usize].clone();
     drop(config);
@@ -411,4 +406,3 @@ async fn clone_request(req: Request<Body>) -> Result<(Request<Body>, Request<Bod
     Ok((req1, req2))
 } 
 
-//metrics TODO
