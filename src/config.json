@@ -1,11 +1,13 @@
 {
     "host": [[127, 0, 0, 1], 3000],
 
-    "timeout_dur": 2,
+    "timeout_dur": 10,
 
     "health_check": 5,
 
     "health_check_path": "/",
+
+    "ddos_sus_threshhold": 10,
 
     "servers": [
 

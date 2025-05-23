@@ -1,4 +1,7 @@
-use std::{fs::File, io::Read, str::FromStr, sync::Arc, thread, time::{Duration, Instant}};
+use dashmap::DashMap;
+use sha2::{Digest, Sha256};
+use redis::AsyncCommands;
+use std::{fs::File, io::Read, iter::from_fn, str::FromStr, sync::Arc, thread, time::{Duration, Instant}};
 use tokio::{sync::Mutex, time::timeout};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
@@ -36,6 +39,8 @@ struct Config {
     timeout_dur: u64,
     health_check: u64,
     health_check_path: String,
+    ddos_sus_threshhold: u64,
+
     #[serde(skip)]
     servers: Vec<Arc<Mutex<Server>>>,
 }
@@ -46,6 +51,36 @@ enum ErrorTypes {
     TimeoutError,
     NoHealthyServerFound,
     HealthCheckFailed,
+    DDoSsus
+}
+
+
+
+
+use std::sync::atomic::{AtomicU32, Ordering};
+type RateLimitMap = Lazy<Arc<DashMap<String, (AtomicU32, Instant)>>>;
+
+static RATE_LIMITS: RateLimitMap = Lazy::new(|| {
+    Arc::new(DashMap::new())
+});
+
+fn ddos(ip: String, threshhold: u64) -> bool {
+    let now = Instant::now();
+
+    let mut entry = RATE_LIMITS.entry(ip.clone()).or_insert_with(|| (AtomicU32::new(0), now));
+
+    if now.duration_since(entry.1) < Duration::from_secs(1) {
+        let current_count = entry.0.load(Ordering::Relaxed);
+        if u64::from(current_count) >= threshhold {
+            return false;
+        }
+        entry.0.fetch_add(1, Ordering::Relaxed);
+    } else {
+        entry.0.store(1, Ordering::Relaxed);
+        entry.1 = now;
+    }
+
+    true
 }
 
 async fn proxy(
@@ -53,25 +88,46 @@ async fn proxy(
     client: Arc<Client<HttpConnector>>,
     origin_ip: String,
     timeout_dur: u64,
+    redis_conn: Arc<Mutex<redis::aio::Connection>>,
+    ddos_threshhold: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
+    if ddos(origin_ip.clone(), ddos_threshhold) == false {
+        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
+    }
 
     let mut count = -1;
     let mut X = CLIclient::reqs.write().await;
     *X += 1u64;
     drop(X);
 
-    loop{
+    let mut cache_req: Request<Body>;
+    (cache_req, req) = clone_request(req).await.unwrap();
+
+    let cache_key = build_cache_key(&mut cache_req).await.unwrap();
+
+    {
+        let mut redis = redis_conn.lock().await;
+        match redis.get::<_, String>(&cache_key).await {
+            Ok(cached_value) => {
+                // Found in cache, return as response
+                return Ok(Response::new(Body::from(cached_value)))
+            }
+            _ => {}
+        }
+    }
+
+    loop {
         count += 1;
         let req_clone: Request<Body>;
         (req_clone, req) = clone_request(req).await.unwrap();
 
-        if let Err(err) = updateTARGET().await{
+        if let Err(err) = updateTARGET().await {
             return Err(err)
         }
 
-        let guard = TARGET.lock().await; 
+        let guard = TARGET.lock().await;
         let target_arc = guard.clone().unwrap();
-        let mut target = target_arc.lock().await; 
+        let mut target = target_arc.lock().await;
 
         let new_uri = format!(
             "{}{}",
@@ -101,34 +157,77 @@ async fn proxy(
 
         match timeout_result {
             Ok(result) => match result {
-                Ok(response) => {
+                Ok(mut response) => {
+                    // for metrics + weight
                     let mut max = max_res.lock().await;
-                    if start.elapsed().as_millis() as u64 > *max as u64{
+                    if start.elapsed().as_millis() as u64 > *max as u64 {
                         *max = start.elapsed().as_millis() as u64;
                     }
-                    target.res_time = ( (start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
+                    target.res_time = ((start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
+
+                    // cache
+                    if let Some(cache_control) = response.headers().get("cache-control") {
+                        if let Ok(cc_str) = cache_control.to_str() {
+                            if let Ok(max_age_secs) = cc_str.parse::<usize>() {
+                                if max_age_secs > 0 {
+                                    let status = response.status();
+                                    let version = response.version();
+                                    let headers = response.headers().clone(); // clone headers
+
+                                    let body_bytes = hyper::body::to_bytes(response.into_body()).await?;
+                                    let body_clone_for_cache = body_bytes.clone(); 
+                                    let body_clone_for_response = body_bytes.clone();
+
+                                    let body_string = String::from_utf8(body_clone_for_cache.to_vec()).unwrap();
+
+                                    let mut redis = redis_conn.lock().await;
+                                    redis.set_ex::<_, _, ()>(&cache_key, body_string, max_age_secs as u64).await?;
+
+                                    // rebuild response
+                                    let mut new_response = Response::builder()
+                                        .status(status)
+                                        .version(version);
+
+                                    for (k, v) in headers.iter() {
+                                        new_response = new_response.header(k, v);
+                                    }
+
+                                    let rebuilt = new_response
+                                        .body(Body::from(body_clone_for_response))
+                                        .unwrap();
+
+                                    return Ok(rebuilt);
+
+                                }
+                            }
+                        }
+                    }
+
                     return Ok(response)
                 }
-                //this can be intended by the server, dont make it non active
-                Err(_) => {if count >= 1{return Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed)))}}, 
+                // this can be intended by the server, don't mark as non-active
+                Err(_) => {
+                    if count >= 1 {
+                        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed)))
+                    }
+                }
             },
             Err(_) => {
-                if target.strict_timeout{
+                if target.strict_timeout {
                     target.is_active = false;
-                } else{
+                } else {
                     target.timeout_tick += 1;
-                    if target.timeout_tick >= 3{
+                    if target.timeout_tick >= 3 {
                         target.is_active = false;
                     }
                 }
-                if count >= 1{
+                if count >= 1 {
                     return Err(anyhow::Error::msg(format_error_type(ErrorTypes::TimeoutError)))
                 }
             }
         }
     }
 }
-
 
 async fn health_check_proxy(
     client: Arc<Client<HttpConnector>>,
@@ -166,13 +265,22 @@ async fn health_check_proxy(
 
 #[tokio::main]
 async fn main() {
+
+    let redis_client = redis::Client::open("redis://127.0.0.1:7000/").unwrap();
+    let con = Arc::new(Mutex::new(redis_client.get_async_connection().await.unwrap()));
+
     {
-        let mut config = &CONFIG.lock().await;
+        let config = CONFIG.lock().await;
         let server = config.servers[0].clone();
         *TARGET.lock().await = Some(server);
     }
 
-    let timeout_dur = CONFIG.lock().await.timeout_dur;
+    let config_guard = CONFIG.lock().await;
+    let timeout_dur = config_guard.timeout_dur;
+    let ddos_thresh = config_guard.ddos_sus_threshhold;
+
+    drop(config_guard);
+
     let addr = ([127, 0, 0, 1], 3000).into();
     let client = Arc::new(Client::new());
 
@@ -181,21 +289,27 @@ async fn main() {
         let client = client.clone();
         let timeout_dur = timeout_dur.clone();
 
+        let redis_conn = con.clone();
+        let thresh = ddos_thresh.clone();
+
         async move {
             Ok::<_, anyhow::Error>(service_fn(move |req| {
                 let client = client.clone();
                 let remote = remote_addr.clone();
 
+                let redis_conn = redis_conn.clone();
+                let thresh = thresh.clone();
+
                 async move {
-                    match proxy(req, client, remote, timeout_dur.clone()).await {
+                    match proxy(req, client, remote, timeout_dur.clone(), redis_conn.clone(), thresh.clone()).await {
                         Ok(response) => {
-                            Ok::<Response<Body>, anyhow::Error>(response)
+                            Ok::<_, anyhow::Error>(response)
                         },
                         Err(err) => {
-                            //println!("Proxy error: {:?}", err); FIXME
+                            // println!("Proxy error: {:?}", err); FIXME
                             Ok(Response::builder()
                                 .status(hyper::StatusCode::BAD_GATEWAY)
-                                .body(Body::from(err.to_string()))
+                                .body(hyper::Body::from(err.to_string()))
                                 .unwrap())
                         }
                     }
@@ -207,7 +321,7 @@ async fn main() {
     let server = HyperServer::bind(&addr).serve(make_svc);
 
     let healthCheck = tokio::spawn(async move {
-        
+
         let client = Arc::new(Client::new());
         let config_guard = CONFIG.lock().await;
         let timeout_dur = config_guard.timeout_dur;
@@ -223,12 +337,12 @@ async fn main() {
         let health_check_path = config_guard.health_check_path.clone();
         drop(config_guard);
 
-        loop{
+        loop {
             tokio::time::sleep(Duration::from_secs(health_check)).await;
 
             let mut Servers = servers.clone();
 
-            for server in Servers{
+            for server in Servers {
                 health_check_proxy(client.clone(), timeout_dur.clone(), server, health_check_path.clone()).await;
             }
 
@@ -237,17 +351,14 @@ async fn main() {
         }
     });
 
-   let clientRun = tokio::spawn(async {
-
-        //cli
+    let clientRun = tokio::spawn(async {
+        // cli
         CLIclient::establish().await;
-
-   }); 
+    });
 
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
     }
-
 }
 
 fn format_error_type(err: ErrorTypes) -> String {
@@ -265,6 +376,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         timeout_dur: u64,
         health_check: u64,
         health_check_path: String,
+        ddos_sus_threshhold: u64,
         servers: Vec<Server>,
     }
 
@@ -282,6 +394,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         timeout_dur: raw_config.timeout_dur,
         health_check: raw_config.health_check,
         health_check_path: raw_config.health_check_path,
+        ddos_sus_threshhold: raw_config.ddos_sus_threshhold,
         servers,
     })
 }
@@ -406,3 +519,17 @@ async fn clone_request(req: Request<Body>) -> Result<(Request<Body>, Request<Bod
     Ok((req1, req2))
 } 
 
+pub async fn build_cache_key(req: &mut Request<Body>) -> Result<String, anyhow::Error> {
+    let method = req.method().as_str();
+    let uri = req.uri().to_string();
+
+    let method = req.method().clone();
+
+    let whole_body = to_bytes(req.body_mut()).await?;
+    let body_hash = Sha256::digest(&whole_body);
+    let body_digest = hex::encode(body_hash); 
+
+    *req.body_mut() = Body::from(whole_body);
+
+    Ok(format!("CACHE:{}:{}:{}", method, uri, body_digest))
+}

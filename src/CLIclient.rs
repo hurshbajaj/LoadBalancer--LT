@@ -63,7 +63,7 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let [graph_sect, metric_sect] = Layout::vertical([Constraint::Percentage(35), Constraint::Fill(1)]).areas(frame.area());
+        let [graph_sect] = Layout::vertical([Constraint::Fill(1)]).areas(frame.area());
 
         let x_min = self.req_chart_vals.first().map(|(x, _)| *x).unwrap_or(0.0);
         let x_max = self.req_chart_vals.last().map(|(x, _)| *x).unwrap_or(1.0);
@@ -102,7 +102,6 @@ impl App {
             );
 
         frame.render_widget(chart, graph_sect);
-        frame.render_widget(Block::bordered(), metric_sect);
     }
 
     fn handle_crossterm_events(&mut self) -> Result<()> {

@@ -18,3 +18,8 @@ color-eyre = "0.6.4"
 crossterm = "0.29.0"
 ratatui = "0.29.0"
 chrono = "0.4.41"
+redis = { version = "0.25", features = ["tokio-comp"] }
+sha256 = "1.6.0"
+hex = "0.4.3"
+sha2 = "0.10.9"
+dashmap = "6.1.0"
