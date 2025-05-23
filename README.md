@@ -14,7 +14,8 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - Custom Reverse Proxy
 - Inactive Servers due to Timeout Window revaluation
 - Failovers
+- Basic DDoS Proofing
+- Redis Cache
 <hr>
 
-*1.0* 
-Current logs undescriptive & improper, solely meant for debugging.
+*2.0* 
