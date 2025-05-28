@@ -54,9 +54,6 @@ enum ErrorTypes {
     DDoSsus
 }
 
-
-
-
 use std::sync::atomic::{AtomicU32, Ordering};
 type RateLimitMap = Lazy<Arc<DashMap<String, (AtomicU32, Instant)>>>;
 
@@ -319,6 +316,13 @@ async fn main() {
     });
 
     let server = HyperServer::bind(&addr).serve(make_svc);
+
+    let clear_ddos = tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Arc::clone(&RATE_LIMITS).clear();
+        }
+    });
 
     let healthCheck = tokio::spawn(async move {
 
