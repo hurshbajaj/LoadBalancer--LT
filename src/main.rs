@@ -1,7 +1,7 @@
 use dashmap::DashMap;
-use sha2::{Digest, Sha256};
+use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
-use std::{fs::File, io::Read, iter::from_fn, str::FromStr, sync::Arc, thread, time::{Duration, Instant}};
+use std::{fs::File, io::Read, iter::from_fn, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
 use tokio::{sync::Mutex, time::timeout};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
@@ -11,11 +11,13 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize};
 use serde_json;
 
+use futures::future::join_all;
+
 mod CLIclient;
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
 static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
-static max_res: Lazy<Mutex<u64>> =  Lazy::new(|| Mutex::new(0u64));
+static max_res: Lazy<Mutex<u64>> =  Lazy::new(|| Mutex::new(1u64));
 
 static atServerIdx: Lazy<Mutex<[u64; 2]>> = Lazy::new(|| Mutex::new([0u64, 0u64]));
 
@@ -36,10 +38,13 @@ struct Server {
 #[derive(Deserialize, Clone)]
 struct Config {
     host: IpStruct,
+    redis_server: u64,
     timeout_dur: u64,
     health_check: u64,
     health_check_path: String,
-    ddos_sus_threshhold: u64,
+    dos_sus_threshhold: u64,
+    ddos_cap: u64,
+    ddos_a: u64,
 
     #[serde(skip)]
     servers: Vec<Arc<Mutex<Server>>>,
@@ -51,33 +56,49 @@ enum ErrorTypes {
     TimeoutError,
     NoHealthyServerFound,
     HealthCheckFailed,
+    DoSsus,
     DDoSsus
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
-type RateLimitMap = Lazy<Arc<DashMap<String, (AtomicU32, Instant)>>>;
+type RateLimitMap = Lazy<Arc<DashMap<String, AtomicU32>>>;
 
 static RATE_LIMITS: RateLimitMap = Lazy::new(|| {
     Arc::new(DashMap::new())
 });
 
-fn ddos(ip: String, threshhold: u64) -> bool {
+static MaxConcurrent: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0)); 
+
+fn dos(ip: String, threshhold: u64) -> bool {
     let now = Instant::now();
 
-    let mut entry = RATE_LIMITS.entry(ip.clone()).or_insert_with(|| (AtomicU32::new(0), now));
+    let mut entry = RATE_LIMITS.entry(ip.clone()).or_insert_with(|| AtomicU32::new(0));
 
-    if now.duration_since(entry.1) < Duration::from_secs(1) {
-        let current_count = entry.0.load(Ordering::Relaxed);
-        if u64::from(current_count) >= threshhold {
-            return false;
-        }
-        entry.0.fetch_add(1, Ordering::Relaxed);
-    } else {
-        entry.0.store(1, Ordering::Relaxed);
-        entry.1 = now;
+    let current_count = entry.load(Ordering::SeqCst);
+    if u64::from(current_count) >= threshhold {
+        return false;
     }
+    entry.fetch_add(1, Ordering::SeqCst);
 
     true
+}
+
+async fn ddos() -> bool {
+    let cg = CONFIG.lock().await;
+
+    let Concurrent_r = RATE_LIMITS.iter().map(|v| v.value().load(Ordering::SeqCst)).sum::<u32>() as u64;
+    let old = MaxConcurrent.load(Ordering::SeqCst);
+    let new = (((old as f64) * 0.9 + (Concurrent_r as f64) * 0.1).ceil() as u64).min(cg.ddos_cap).max(cg.ddos_a);
+
+    MaxConcurrent.store(new, Ordering::SeqCst); 
+
+    println!("{:?} , maxs: {}", Concurrent_r , MaxConcurrent.load(Ordering::SeqCst));
+
+    if Concurrent_r > MaxConcurrent.load(Ordering::SeqCst) {
+        return false
+    }
+
+    return true
 }
 
 async fn proxy(
@@ -86,9 +107,16 @@ async fn proxy(
     origin_ip: String,
     timeout_dur: u64,
     redis_conn: Arc<Mutex<redis::aio::Connection>>,
-    ddos_threshhold: u64,
+    dos_threshhold: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
-    if ddos(origin_ip.clone(), ddos_threshhold) == false {
+
+    //no hangup
+    //current concurrent fix
+    if dos(origin_ip.clone(), dos_threshhold) == false {
+        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DoSsus)))
+    }
+
+    if ddos().await == false{
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
     }
 
@@ -263,9 +291,6 @@ async fn health_check_proxy(
 #[tokio::main]
 async fn main() {
 
-    let redis_client = redis::Client::open("redis://127.0.0.1:7000/").unwrap();
-    let con = Arc::new(Mutex::new(redis_client.get_async_connection().await.unwrap()));
-
     {
         let config = CONFIG.lock().await;
         let server = config.servers[0].clone();
@@ -274,9 +299,13 @@ async fn main() {
 
     let config_guard = CONFIG.lock().await;
     let timeout_dur = config_guard.timeout_dur;
-    let ddos_thresh = config_guard.ddos_sus_threshhold;
+    let dos_thresh = config_guard.dos_sus_threshhold;
+    let redis_port = config_guard.redis_server;
 
     drop(config_guard);
+
+    let redis_client = redis::Client::open(format!("redis://127.0.0.1:{redis_port}/"), ).unwrap(); 
+    let con = Arc::new(Mutex::new(redis_client.get_async_connection().await.unwrap()));
 
     let addr = ([127, 0, 0, 1], 3000).into();
     let client = Arc::new(Client::new());
@@ -287,7 +316,7 @@ async fn main() {
         let timeout_dur = timeout_dur.clone();
 
         let redis_conn = con.clone();
-        let thresh = ddos_thresh.clone();
+        let thresh = dos_thresh.clone();
 
         async move {
             Ok::<_, anyhow::Error>(service_fn(move |req| {
@@ -300,10 +329,10 @@ async fn main() {
                 async move {
                     match proxy(req, client, remote, timeout_dur.clone(), redis_conn.clone(), thresh.clone()).await {
                         Ok(response) => {
+
                             Ok::<_, anyhow::Error>(response)
                         },
                         Err(err) => {
-                            // println!("Proxy error: {:?}", err); FIXME
                             Ok(Response::builder()
                                 .status(hyper::StatusCode::BAD_GATEWAY)
                                 .body(hyper::Body::from(err.to_string()))
@@ -317,9 +346,9 @@ async fn main() {
 
     let server = HyperServer::bind(&addr).serve(make_svc);
 
-    let clear_ddos = tokio::spawn(async {
+    let clear_dos = tokio::spawn(async {
         loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
             Arc::clone(&RATE_LIMITS).clear();
         }
     });
@@ -377,10 +406,13 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
     #[derive(Deserialize)]
     struct RawConfig {
         host: IpStruct,
+        redis_server: u64,
         timeout_dur: u64,
         health_check: u64,
         health_check_path: String,
-        ddos_sus_threshhold: u64,
+        dos_sus_threshhold: u64,
+        ddos_cap: u64,
+        ddos_a: u64,
         servers: Vec<Server>,
     }
 
@@ -395,10 +427,13 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
 
     Ok(Config {
         host: raw_config.host,
+        redis_server: raw_config.redis_server,
         timeout_dur: raw_config.timeout_dur,
         health_check: raw_config.health_check,
         health_check_path: raw_config.health_check_path,
-        ddos_sus_threshhold: raw_config.ddos_sus_threshhold,
+        dos_sus_threshhold: raw_config.dos_sus_threshhold,
+        ddos_cap: raw_config.ddos_cap,
+        ddos_a: raw_config.ddos_a,
         servers,
     })
 }
@@ -537,3 +572,4 @@ pub async fn build_cache_key(req: &mut Request<Body>) -> Result<String, anyhow::
 
     Ok(format!("CACHE:{}:{}:{}", method, uri, body_digest))
 }
+

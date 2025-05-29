@@ -1,13 +1,19 @@
 {
     "host": [[127, 0, 0, 1], 3000],
 
+    "redis_server": 7001,
+
     "timeout_dur": 10,
 
     "health_check": 5,
 
     "health_check_path": "/",
 
-    "ddos_sus_threshhold": 10,
+    "dos_sus_threshhold": 1000,
+
+    "ddos_cap": 10000,
+
+    "ddos_a": 5,
 
     "servers": [
 

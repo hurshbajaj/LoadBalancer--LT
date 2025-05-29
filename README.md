@@ -14,8 +14,10 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - Custom Reverse Proxy
 - Inactive Servers due to Timeout Window revaluation
 - Failovers
-- Basic DDoS Proofing
+- DDoS / Dos Proofing
+- DDoS threshold via | Exponentially Weighted Moving Average | & | dynamic |
+- Dos threshold | manual | & | static |
 - Redis Cache
 <hr>
 
-*2.0* 
+*2.5* 
