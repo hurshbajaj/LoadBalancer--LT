@@ -92,8 +92,6 @@ async fn ddos() -> bool {
 
     MaxConcurrent.store(new, Ordering::SeqCst); 
 
-    println!("{:?} , maxs: {}", Concurrent_r , MaxConcurrent.load(Ordering::SeqCst));
-
     if Concurrent_r > MaxConcurrent.load(Ordering::SeqCst) {
         return false
     }
