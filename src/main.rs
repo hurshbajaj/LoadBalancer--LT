@@ -89,14 +89,13 @@ fn dos(ip: String, threshhold: u64) -> bool {
 
 async fn ddos() -> bool {
     //let aa = 0.000000004;
-    let aa = 0.1;
 
     let mut ret_f = false;
     let cg = CONFIG.lock().await;
 
     let Concurrent_r = RATE_LIMITS.iter().map(|v| v.value().load(Ordering::SeqCst)).sum::<u32>() as u64;
     let old = MaxConcurrent.load(Ordering::SeqCst);
-    let new = (((old as f64) * (1f64- aa) + (Concurrent_r as f64) * aa).ceil() as u64).min(cg.ddos_cap).max(cg.ddos_initial_seed);
+    let new = (((old as f64) * (1f64- cg.ddos_a) + (Concurrent_r as f64) * cg.ddos_a).ceil() as u64).min(cg.ddos_cap).max(cg.ddos_initial_seed);
 
     MaxConcurrent.store(new, Ordering::SeqCst); 
 
@@ -134,7 +133,7 @@ async fn proxy(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if !useragents::user_agents.contains(&user_agent) {
+    if !useragents::contains(user_agent) {
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::InvalidUserAgent)));
     }
 

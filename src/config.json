@@ -9,7 +9,7 @@
     "dos_sus_threshhold": 1000,
 
     "ddos_cap": 10000,
-    "ddos_a": 0.1,
+    "ddos_a": 0.5,
     "ddos_initial_seed":5,
 
     "servers": [
