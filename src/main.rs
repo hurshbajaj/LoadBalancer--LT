@@ -14,6 +14,8 @@ use serde_json;
 use futures::future::join_all;
 
 mod CLIclient;
+mod useragents;
+use regex::Regex;
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
 static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
@@ -44,7 +46,8 @@ struct Config {
     health_check_path: String,
     dos_sus_threshhold: u64,
     ddos_cap: u64,
-    ddos_a: u64,
+    ddos_a: f64,
+    ddos_initial_seed: u64,
 
     #[serde(skip)]
     servers: Vec<Arc<Mutex<Server>>>,
@@ -57,7 +60,8 @@ enum ErrorTypes {
     NoHealthyServerFound,
     HealthCheckFailed,
     DoSsus,
-    DDoSsus
+    DDoSsus,
+    InvalidUserAgent,
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -84,18 +88,25 @@ fn dos(ip: String, threshhold: u64) -> bool {
 }
 
 async fn ddos() -> bool {
+    //let aa = 0.000000004;
+    let aa = 0.1;
+
+    let mut ret_f = false;
     let cg = CONFIG.lock().await;
 
     let Concurrent_r = RATE_LIMITS.iter().map(|v| v.value().load(Ordering::SeqCst)).sum::<u32>() as u64;
     let old = MaxConcurrent.load(Ordering::SeqCst);
-    let new = (((old as f64) * 0.9 + (Concurrent_r as f64) * 0.1).ceil() as u64).min(cg.ddos_cap).max(cg.ddos_a);
+    let new = (((old as f64) * (1f64- aa) + (Concurrent_r as f64) * aa).ceil() as u64).min(cg.ddos_cap).max(cg.ddos_initial_seed);
 
     MaxConcurrent.store(new, Ordering::SeqCst); 
 
     if Concurrent_r > MaxConcurrent.load(Ordering::SeqCst) {
-        return false
+        ret_f = true;
     }
 
+    if ret_f == true{
+        return false;
+    }
     return true
 }
 
@@ -116,6 +127,15 @@ async fn proxy(
 
     if ddos().await == false{
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
+    }
+
+    let user_agent = req.headers()
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if !useragents::user_agents.contains(&user_agent) {
+        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::InvalidUserAgent)));
     }
 
     let mut count = -1;
@@ -410,7 +430,8 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         health_check_path: String,
         dos_sus_threshhold: u64,
         ddos_cap: u64,
-        ddos_a: u64,
+        ddos_a: f64,
+        ddos_initial_seed: u64,
         servers: Vec<Server>,
     }
 
@@ -432,6 +453,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         dos_sus_threshhold: raw_config.dos_sus_threshhold,
         ddos_cap: raw_config.ddos_cap,
         ddos_a: raw_config.ddos_a,
+        ddos_initial_seed: raw_config.ddos_initial_seed,
         servers,
     })
 }
