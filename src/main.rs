@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
-use std::{fs::File, io::Read, iter::from_fn, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
+use std::{fs::File, io::Read, iter::from_fn, os::raw, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
 use tokio::{sync::{Mutex, MutexGuard}, time::timeout};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
@@ -58,6 +58,7 @@ struct Config {
     dos_sus_threshhold: u64,
     ddos_cap: u64,
     ddos_grace_factor: f64,
+    ban_timeout: u64,
 
     #[serde(skip)]
     servers: Vec<Arc<Mutex<Server>>>,
@@ -162,16 +163,14 @@ async fn proxy(
 
     let methd = req.method();
 
-    if !verify_hmac_from_env(methd.to_string().as_str(), Hmac) {
-        println!("hash!?!?!");
-        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Suspiscious)));
-    }
-
-    if !useragents::contains(user_agent) {
+//   if !useragents::contains(user_agent) {
+   if user_agent.len() < 50 {
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::InvalidUserAgent)));
     }
 
-
+    if !verify_hmac_from_env(methd.to_string().as_str(), Hmac) {
+        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Suspiscious)));
+    }
 
     let mut cache_req: Request<Body>;
     (cache_req, req) = clone_request(req).await.unwrap();
@@ -419,6 +418,13 @@ async fn main() {
         }
     });
 
+    let clear_ban = tokio::spawn(async {
+        loop{
+            tokio::time::sleep(Duration::from_secs(CONFIG.lock().await.ban_timeout));
+            ban_list.write().await.clear();
+        }
+    });
+
     let healthCheck = tokio::spawn(async move {
 
         let client = Arc::new(Client::new());
@@ -480,6 +486,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         dos_sus_threshhold: u64,
         ddos_cap: u64,
         ddos_grace_factor: f64,
+        ban_timeout: u64,
         servers: Vec<Server>,
     }
 
@@ -501,6 +508,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         dos_sus_threshhold: raw_config.dos_sus_threshhold,
         ddos_cap: raw_config.ddos_cap,
         ddos_grace_factor: raw_config.ddos_grace_factor,
+        ban_timeout: raw_config.ban_timeout,
         servers,
     })
 }

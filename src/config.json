@@ -8,8 +8,10 @@
 
     "dos_sus_threshhold": 1000,
 
-    "ddos_cap": 10000,
-    "ddos_grace_factor": 5,
+    "ddos_cap": 100,
+    "ddos_grace_factor": 10,
+
+    "ban_timeout": 300,
 
     "servers": [
 
