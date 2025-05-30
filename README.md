@@ -15,7 +15,7 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - Inactive Servers due to Timeout Window revaluation
 - Failovers
 - DDoS / Dos Proofing
-- DDoS threshold via | Exponentially Weighted Moving Average | & | dynamic |
+- DDoS threshold via | Sliding Window | & | dynamic |
 - Dos threshold | manual | & | static |
 - Redis Cache
 <hr>

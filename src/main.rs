@@ -14,6 +14,13 @@ use std::collections::VecDeque;
 
 use futures::future::join_all;
 
+use std::env;
+use dotenv::dotenv;
+use hmac::{Hmac, Mac};
+use base64::{engine::general_purpose, Engine as _};
+
+type HmacSha256 = Hmac<Sha256>;
+
 mod CLIclient;
 mod useragents;
 use regex::Regex;
@@ -62,6 +69,7 @@ enum ErrorTypes {
     DoSsus,
     DDoSsus,
     InvalidUserAgent,
+    Suspiscious,
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -149,9 +157,22 @@ async fn proxy(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    let Hmac = req.headers()
+        .get("X-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let methd = req.method();
+
+    if !verify_hmac_from_env(methd.to_string().as_str(), Hmac) {
+        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Suspiscious)));
+    }
+
     if !useragents::contains(user_agent) {
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::InvalidUserAgent)));
     }
+
+
 
     let mut cache_req: Request<Body>;
     (cache_req, req) = clone_request(req).await.unwrap();
@@ -618,3 +639,21 @@ pub async fn build_cache_key(req: &mut Request<Body>) -> Result<String, anyhow::
     Ok(format!("CACHE:{}:{}:{}", method, uri, body_digest))
 }
 
+pub fn verify_hmac_from_env(message: &str, provided_hash: &str) -> bool {
+    dotenv().ok();
+    let secret = match env::var("secret") {
+        Ok(val) => val,
+        Err(_) => return false,
+    };
+
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(mac) => mac,
+        Err(_) => return false,
+    };
+    mac.update(message.as_bytes());
+    let result = mac.finalize();
+    let code_bytes = result.into_bytes();
+    let calculated_hash = general_purpose::STANDARD.encode(code_bytes);
+
+    calculated_hash == provided_hash
+}
