@@ -18,6 +18,7 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - DDoS threshold via | Sliding Window | & | dynamic |
 - Dos threshold | manual | & | static |
 - Redis Cache
+- HMAC
 <hr>
 
 *2.5* 
