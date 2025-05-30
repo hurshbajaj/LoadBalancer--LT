@@ -10,6 +10,7 @@ use anyhow::{self, Context};
 use once_cell::sync::Lazy;
 use serde::{Deserialize};
 use serde_json;
+use std::collections::VecDeque;
 
 use futures::future::join_all;
 
@@ -46,8 +47,7 @@ struct Config {
     health_check_path: String,
     dos_sus_threshhold: u64,
     ddos_cap: u64,
-    ddos_a: f64,
-    ddos_initial_seed: u64,
+    ddos_grace_factor: f64,
 
     #[serde(skip)]
     servers: Vec<Arc<Mutex<Server>>>,
@@ -87,26 +87,38 @@ fn dos(ip: String, threshhold: u64) -> bool {
     true
 }
 
-async fn ddos() -> bool {
-    //let aa = 0.000000004;
+struct SlidingQuantile {
+    window: VecDeque<u32>,
+    max_size: usize,
+}
 
-    let mut ret_f = false;
-    let cg = CONFIG.lock().await;
+impl SlidingQuantile {
+    fn new(size: usize) -> Self {
 
-    let Concurrent_r = RATE_LIMITS.iter().map(|v| v.value().load(Ordering::SeqCst)).sum::<u32>() as u64;
-    let old = MaxConcurrent.load(Ordering::SeqCst);
-    let new = (((old as f64) * (1f64- cg.ddos_a) + (Concurrent_r as f64) * cg.ddos_a).ceil() as u64).min(cg.ddos_cap).max(cg.ddos_initial_seed);
+        let mut deque: VecDeque<u32> = VecDeque::with_capacity(size);
+        deque.extend(std::iter::repeat(1).take(size));
 
-    MaxConcurrent.store(new, Ordering::SeqCst); 
-
-    if Concurrent_r > MaxConcurrent.load(Ordering::SeqCst) {
-        ret_f = true;
+        Self { window: deque, max_size: size }
     }
 
-    if ret_f == true{
-        return false;
+    fn record(&mut self, value: u32) {
+        if self.window.len() == self.max_size {
+            self.window.pop_front();
+        }
+        self.window.push_back(value);
     }
-    return true
+
+    fn quantile(&self, q: f64) -> u32 {
+        let mut sorted: Vec<u32> = self.window.iter().cloned().collect();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() as f64) * q).floor() as usize;
+        sorted.get(idx.min(sorted.len()-1)).cloned().unwrap_or(0)
+    }
+
+    async fn is_anomaly(&self, current: u32, threshold: f64, cap: u64) -> bool {
+        let q = self.quantile(0.99).min(cap as u32);
+        current as f64 > (q as f64) * threshold
+    }
 }
 
 async fn proxy(
@@ -117,6 +129,10 @@ async fn proxy(
     redis_conn: Arc<Mutex<redis::aio::Connection>>,
     dos_threshhold: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
+    let mut count = -1;
+    let mut X = CLIclient::reqs.write().await;
+    *X += 1u64;
+    drop(X);
 
     //no hangup
     //current concurrent fix
@@ -124,7 +140,7 @@ async fn proxy(
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DoSsus)))
     }
 
-    if ddos().await == false{
+    if *(underDDOS.lock().await) == true{
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
     }
 
@@ -136,11 +152,6 @@ async fn proxy(
     if !useragents::contains(user_agent) {
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::InvalidUserAgent)));
     }
-
-    let mut count = -1;
-    let mut X = CLIclient::reqs.write().await;
-    *X += 1u64;
-    drop(X);
 
     let mut cache_req: Request<Body>;
     (cache_req, req) = clone_request(req).await.unwrap();
@@ -305,6 +316,8 @@ async fn health_check_proxy(
     }
 }
 
+static underDDOS: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
+
 #[tokio::main]
 async fn main() {
 
@@ -364,8 +377,22 @@ async fn main() {
     let server = HyperServer::bind(&addr).serve(make_svc);
 
     let clear_dos = tokio::spawn(async {
+        let quant = Arc::new(Mutex::new(SlidingQuantile::new(100)));
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+
+            let total = RATE_LIMITS.iter().map(|v| v.value().load(Ordering::SeqCst)).sum::<u32>() as u64;
+            let qg_arc = Arc::clone(&quant);
+            let mut qg = qg_arc.lock().await;
+            let cg = CONFIG.lock().await;
+            
+            if qg.is_anomaly(total as u32, cg.ddos_grace_factor, cg.ddos_cap).await {
+               *(underDDOS.lock().await) = true; 
+            }else{
+                *(underDDOS.lock().await) = false;  
+                qg.record(total as u32); 
+            }
+
             Arc::clone(&RATE_LIMITS).clear();
         }
     });
@@ -408,6 +435,7 @@ async fn main() {
 
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
+        panic!();
     }
 }
 
@@ -429,8 +457,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         health_check_path: String,
         dos_sus_threshhold: u64,
         ddos_cap: u64,
-        ddos_a: f64,
-        ddos_initial_seed: u64,
+        ddos_grace_factor: f64,
         servers: Vec<Server>,
     }
 
@@ -451,8 +478,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         health_check_path: raw_config.health_check_path,
         dos_sus_threshhold: raw_config.dos_sus_threshhold,
         ddos_cap: raw_config.ddos_cap,
-        ddos_a: raw_config.ddos_a,
-        ddos_initial_seed: raw_config.ddos_initial_seed,
+        ddos_grace_factor: raw_config.ddos_grace_factor,
         servers,
     })
 }
