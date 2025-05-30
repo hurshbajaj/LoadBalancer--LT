@@ -21,4 +21,4 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - HMAC
 <hr>
 
-*2.5* 
+*3* 
