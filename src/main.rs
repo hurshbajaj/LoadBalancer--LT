@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
 use std::{fs::File, io::Read, iter::from_fn, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{sync::{Mutex, MutexGuard}, time::timeout};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
 };
@@ -19,6 +19,8 @@ use dotenv::dotenv;
 use hmac::{Hmac, Mac};
 use base64::{engine::general_purpose, Engine as _};
 
+use tokio::sync::RwLock;
+
 type HmacSha256 = Hmac<Sha256>;
 
 mod CLIclient;
@@ -31,6 +33,7 @@ static max_res: Lazy<Mutex<u64>> =  Lazy::new(|| Mutex::new(1u64));
 
 static atServerIdx: Lazy<Mutex<[u64; 2]>> = Lazy::new(|| Mutex::new([0u64, 0u64]));
 
+static ban_list: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(vec![])); 
 #[derive(Deserialize, Clone)]
 struct IpStruct([u64; 4], u64);
 
@@ -81,19 +84,15 @@ static RATE_LIMITS: RateLimitMap = Lazy::new(|| {
 
 static MaxConcurrent: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0)); 
 
-fn dos(ip: String, threshhold: u64) -> bool {
+fn dos(ip: String, threshhold: u64){
     let now = Instant::now();
 
     let mut entry = RATE_LIMITS.entry(ip.clone()).or_insert_with(|| AtomicU32::new(0));
 
-    let current_count = entry.load(Ordering::SeqCst);
-    if u64::from(current_count) >= threshhold {
-        return false;
-    }
     entry.fetch_add(1, Ordering::SeqCst);
 
-    true
 }
+
 
 struct SlidingQuantile {
     window: VecDeque<u32>,
@@ -142,16 +141,15 @@ async fn proxy(
     *X += 1u64;
     drop(X);
 
-    //no hangup
-    //current concurrent fix
-    if dos(origin_ip.clone(), dos_threshhold) == false {
-        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DoSsus)))
-    }
+    dos(origin_ip.clone(), dos_threshhold);
 
-    if *(underDDOS.lock().await) == true{
+   if ban_list.read().await.contains(&origin_ip.clone()){
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
     }
 
+    //no hangup
+    //current concurrent fix
+    
     let user_agent = req.headers()
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
@@ -165,6 +163,7 @@ async fn proxy(
     let methd = req.method();
 
     if !verify_hmac_from_env(methd.to_string().as_str(), Hmac) {
+        println!("hash!?!?!");
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Suspiscious)));
     }
 
@@ -337,7 +336,6 @@ async fn health_check_proxy(
     }
 }
 
-static underDDOS: Lazy<Mutex<bool>> = Lazy::new(|| Mutex::new(false));
 
 #[tokio::main]
 async fn main() {
@@ -408,9 +406,12 @@ async fn main() {
             let cg = CONFIG.lock().await;
             
             if qg.is_anomaly(total as u32, cg.ddos_grace_factor, cg.ddos_cap).await {
-               *(underDDOS.lock().await) = true; 
+               loop {
+                    if !check_and_ban_top_ip(cg.dos_sus_threshhold).await{
+                        break;
+                    }
+               }
             }else{
-                *(underDDOS.lock().await) = false;  
                 qg.record(total as u32); 
             }
 
@@ -654,6 +655,28 @@ pub fn verify_hmac_from_env(message: &str, provided_hash: &str) -> bool {
     let result = mac.finalize();
     let code_bytes = result.into_bytes();
     let calculated_hash = general_purpose::STANDARD.encode(code_bytes);
+    println!("{:?}", calculated_hash);
+    println!("{:?}", provided_hash);
+    println!("{:?}", calculated_hash == provided_hash);
 
     calculated_hash == provided_hash
+}
+
+async fn check_and_ban_top_ip(max_per: u64) -> bool {
+    let mut entries: Vec<_> = RATE_LIMITS
+        .iter()
+        .map(|kv| (kv.key().clone(), kv.value().load(Ordering::SeqCst)))
+        .collect();
+
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Check the top entry
+    if let Some((ip, count)) = entries.first() {
+        if *count as u64 > max_per {
+            RATE_LIMITS.remove(ip);
+            ban_list.write().await.push(ip.clone());
+            return true;
+        }
+    }
+    false
 }
