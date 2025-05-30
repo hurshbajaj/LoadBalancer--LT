@@ -655,9 +655,6 @@ pub fn verify_hmac_from_env(message: &str, provided_hash: &str) -> bool {
     let result = mac.finalize();
     let code_bytes = result.into_bytes();
     let calculated_hash = general_purpose::STANDARD.encode(code_bytes);
-    println!("{:?}", calculated_hash);
-    println!("{:?}", provided_hash);
-    println!("{:?}", calculated_hash == provided_hash);
 
     calculated_hash == provided_hash
 }
