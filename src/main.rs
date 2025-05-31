@@ -145,11 +145,10 @@ async fn proxy(
 
     dos(origin_ip.clone(), dos_threshhold);
 
-    /*
    if ban_list.read().await.contains(&origin_ip.clone()){
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
     }
-    */
+
     //no hangup
     //current concurrent fix
     
