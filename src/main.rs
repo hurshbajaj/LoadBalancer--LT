@@ -116,18 +116,18 @@ impl SlidingQuantile {
         let mut deque: VecDeque<u32> = VecDeque::with_capacity(size);
         deque.extend(std::iter::repeat(1).take(size));
 
-        Self { window: deque, max_size: size }
+        Self { window: deque, max_size: size } // vec![1, 1, 1, 1, ..]
     }
 
     fn record(&mut self, value: u32) {
         if self.window.len() == self.max_size {
             self.window.pop_front();
         }
-        self.window.push_back(value);
+        self.window.push_back(value); //vec![1, 1, 1, 2]
     }
 
     fn quantile(&self, q: f64) -> u32 {
-        let mut sorted: Vec<u32> = self.window.iter().cloned().collect();
+        let mut sorted: Vec<u32> = self.window.iter().cloned().collect(); //
         sorted.sort_unstable();
         let idx = ((sorted.len() as f64) * q).floor() as usize;
         sorted.get(idx.min(sorted.len()-1)).cloned().unwrap_or(0)
