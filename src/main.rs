@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use ratatui::crossterm::event::{self, Event, KeyCode};
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
 use std::{fs::File, io::Read, iter::from_fn, os::raw, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
@@ -457,7 +458,6 @@ async fn main() {
     });
 
     let clientRun = tokio::spawn(async {
-        // cli
         CLIclient::establish().await;
     });
 
