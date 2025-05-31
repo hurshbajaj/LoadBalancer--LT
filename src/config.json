@@ -13,19 +13,17 @@
 
     "ban_timeout": 300,
 
+    "Method_hash_check": true,
+    "Check_in": false,
+    "Check_out": true,
+
+    "js_challenge": true,
+    "challenge_url": "/js-challenge",
+
     "servers": [
 
         {
-            "ip": "http://localhost:5000",
-            "weight": 1,
-            "is_active": true,
-            "res_time": 0, 
-
-            "strict_timeout": false,
-            "timeout_tick": 0
-        },
-        {
-            "ip": "http://localhost:5001",
+            "ip": "http://localhost:8080",
             "weight": 1,
             "is_active": true,
             "res_time": 0, 

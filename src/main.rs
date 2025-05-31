@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
-use std::{fs::File, io::Read, iter::from_fn, os::raw, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
+use std::{f64::MANTISSA_DIGITS, fs::File, io::Read, iter::from_fn, os::raw, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
 use tokio::{sync::{Mutex, MutexGuard}, time::{self, timeout}};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
@@ -54,15 +54,23 @@ struct Config {
     host: IpStruct,
     redis_server: u64,
     timeout_dur: u64,
+    
     health_check: u64,
     health_check_path: String,
+    
     dos_sus_threshhold: u64,
     ddos_cap: u64,
     ddos_grace_factor: f64,
     ban_timeout: u64,
 
+    Method_hash_check: bool, 
+    js_challenge: bool,
+
     #[serde(skip)]
     servers: Vec<Arc<Mutex<Server>>>,
+    challenge_url: String,
+    Check_out: bool,
+    Check_in: bool,
 }
 
 #[derive(Debug)]
@@ -75,6 +83,7 @@ enum ErrorTypes {
     DDoSsus,
     InvalidUserAgent,
     Suspiscious,
+    Load_balance_Verification_Fail,
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -138,10 +147,6 @@ async fn proxy(
     redis_conn: Arc<Mutex<redis::aio::Connection>>,
     dos_threshhold: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
-    let mut count = -1;
-    let mut X = CLIclient::reqs.write().await;
-    *X += 1u64;
-    drop(X);
 
     dos(origin_ip.clone(), dos_threshhold);
 
@@ -151,6 +156,8 @@ async fn proxy(
 
     //no hangup
     //current concurrent fix
+    
+    let mut check_o = false;
     
     let user_agent = req.headers()
         .get("User-Agent")
@@ -168,10 +175,42 @@ async fn proxy(
    if user_agent.len() < 50 {
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::InvalidUserAgent)));
     }
+    {
 
-    if !verify_hmac_from_env(methd.to_string().as_str(), Hmac) {
-        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Suspiscious)));
+        let config_g = CONFIG.lock().await;
+
+        if req.uri().path() == config_g.challenge_url {
+            match serve_js_challenge("/").await {
+                Ok(x) => return Ok(x),
+                Err(x) => return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Load_balance_Verification_Fail)))
+            }
+        }
+
+        if config_g.Method_hash_check{
+            if config_g.Check_in {
+                if !verify_hmac_from_env(methd.to_string().as_str(), Hmac) {
+                    return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Suspiscious)));
+                }
+            }
+            if config_g.Check_out {
+                check_o = true;
+            }
+        }
+        if !has_js_challenge_cookie(&req) {
+            let redirect_url = format!("{}", config_g.challenge_url);
+            return Ok(Response::builder()
+                .status(302)
+                .header(LOCATION, redirect_url)
+                .body(Body::empty())
+                .unwrap());
+        }
     }
+
+    //hence graph only captures "real" reqs
+    let mut count = -1;
+    let mut X = CLIclient::reqs.write().await;
+    *X += 1u64;
+    drop(X);
 
     let mut cache_req: Request<Body>;
     (cache_req, req) = clone_request(req).await.unwrap();
@@ -220,6 +259,10 @@ async fn proxy(
         }
 
         proxied_req = proxied_req.header("X-Forwarded-For", origin_ip.clone());
+        if check_o{
+            let holdd = methd_hash_from_env(req_clone.method().as_str());
+            proxied_req = proxied_req.header("X-secret", holdd.as_str());
+        }
 
         let proxied_req = proxied_req
             .body(req_clone.into_body())
@@ -299,7 +342,7 @@ async fn proxy(
                 }
             }
         }
-    }
+    };
 }
 
 async fn health_check_proxy(
@@ -488,6 +531,11 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         ddos_grace_factor: f64,
         ban_timeout: u64,
         servers: Vec<Server>,
+        Method_hash_check: bool,
+        js_challenge: bool,
+        challenge_url: String,
+        Check_in: bool,
+        Check_out: bool, 
     }
 
     let raw_config: RawConfig =
@@ -509,6 +557,11 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         ddos_cap: raw_config.ddos_cap,
         ddos_grace_factor: raw_config.ddos_grace_factor,
         ban_timeout: raw_config.ban_timeout,
+        Method_hash_check: raw_config.Method_hash_check,
+        js_challenge: raw_config.js_challenge,
+        challenge_url: raw_config.challenge_url,
+        Check_in: raw_config.Check_in,
+        Check_out: raw_config.Check_out,
         servers,
     })
 }
@@ -667,6 +720,22 @@ pub fn verify_hmac_from_env(message: &str, provided_hash: &str) -> bool {
     calculated_hash == provided_hash
 }
 
+pub fn methd_hash_from_env(message: &str) -> String {
+    dotenv().ok();
+    let secret = match env::var("secret") {
+        Ok(val) => val,
+        Err(_) => return String::new(),
+    };
+
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap(); 
+    mac.update(message.as_bytes());
+    let result = mac.finalize();
+    let code_bytes = result.into_bytes();
+    let calculated_hash = general_purpose::STANDARD.encode(code_bytes);
+
+    calculated_hash
+}
+
 async fn check_and_ban_top_ip(max_per: u64) -> bool {
     let mut entries: Vec<_> = RATE_LIMITS
         .iter()
@@ -683,6 +752,43 @@ async fn check_and_ban_top_ip(max_per: u64) -> bool {
                 ban_list.write().await.push(ip.clone());
             }
             return true;
+        }
+    }
+    false
+}
+
+use hyper::header::{SET_COOKIE, LOCATION, COOKIE}; 
+use urlencoding;
+
+async fn serve_js_challenge(red: &str) -> Result<Response<Body>, hyper::Error> {
+    let html = format!(
+        r#"
+        <html>
+        <head><title>Checking your browser...</title></head>
+        <body style="background-color: #0D0E11">
+        <script>
+          document.cookie = "jschallenge=1; path=/";
+          window.location = decodeURIComponent("{}");
+        </script>
+        <noscript>
+          <p>Please enable JavaScript to pass this challenge.</p>
+        </noscript>
+        </body>
+        </html>
+        "#,
+        red
+    );
+    Ok(Response::builder()
+        .status(200)
+        .header("content-type", "text/html")
+        .body(Body::from(html))
+        .unwrap())
+}
+
+fn has_js_challenge_cookie(req: &Request<Body>) -> bool {
+    if let Some(cookie_header) = req.headers().get(COOKIE) {
+        if let Ok(cookie_str) = cookie_header.to_str() {
+            return cookie_str.split(';').any(|kv| kv.trim_start().starts_with("jschallenge=1"));
         }
     }
     false
