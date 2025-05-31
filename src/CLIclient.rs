@@ -119,7 +119,7 @@ impl App {
     fn on_key_event(&mut self, key: KeyEvent) {
         match (key.modifiers, key.code) {
             (_, KeyCode::Esc | KeyCode::Char('q'))
-            | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => {},
+            | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => { self.quit() },
             _ => {}
         }
     }

@@ -3,7 +3,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode};
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
 use std::{fs::File, io::Read, iter::from_fn, os::raw, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
-use tokio::{sync::{Mutex, MutexGuard}, time::timeout};
+use tokio::{sync::{Mutex, MutexGuard}, time::{self, timeout}};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
 };
@@ -145,10 +145,11 @@ async fn proxy(
 
     dos(origin_ip.clone(), dos_threshhold);
 
+    /*
    if ban_list.read().await.contains(&origin_ip.clone()){
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
     }
-
+    */
     //no hangup
     //current concurrent fix
     
@@ -397,6 +398,8 @@ async fn main() {
 
     let clear_dos = tokio::spawn(async {
         let quant = Arc::new(Mutex::new(SlidingQuantile::new(100)));
+        let mut last_ban_clear = Instant::now(); // keep track of last ban_list clear time
+
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
 
@@ -404,25 +407,23 @@ async fn main() {
             let qg_arc = Arc::clone(&quant);
             let mut qg = qg_arc.lock().await;
             let cg = CONFIG.lock().await;
-            
+
+            if last_ban_clear.elapsed().as_secs() >= cg.ban_timeout {
+                ban_list.write().await.clear();
+                last_ban_clear = Instant::now();
+            }
+
             if qg.is_anomaly(total as u32, cg.ddos_grace_factor, cg.ddos_cap).await {
-               loop {
-                    if !check_and_ban_top_ip(cg.dos_sus_threshhold).await{
+                loop {
+                    if !check_and_ban_top_ip(cg.dos_sus_threshhold).await {
                         break;
                     }
-               }
-            }else{
-                qg.record(total as u32); 
+                }
+            } else {
+                qg.record(total as u32);
             }
 
             Arc::clone(&RATE_LIMITS).clear();
-        }
-    });
-
-    let clear_ban = tokio::spawn(async {
-        loop{
-            tokio::time::sleep(Duration::from_secs(CONFIG.lock().await.ban_timeout));
-            ban_list.write().await.clear();
         }
     });
 
@@ -526,9 +527,9 @@ async fn updateTARGET() -> anyhow::Result<()> {
     let mut at_server_idx = atServerIdx.lock().await;
 
     //next server IDEALLY
-    if at_server_idx[1] >= target.weight{ //next server needed
+    if at_server_idx[1] >= target.weight{ 
         at_server_idx[1] = 0;
-        if at_server_idx[0] == config.servers.len() as u64 - 1{ //at last server in list
+        if at_server_idx[0] == config.servers.len() as u64 - 1{ 
             at_server_idx[0] = 0;
         }else{
             at_server_idx[0] += 1;
@@ -552,7 +553,7 @@ async fn updateTARGET() -> anyhow::Result<()> {
             foundHealthy = true;
             break;
         }else{
-            if at_server_idx[0] == config.servers.len() as u64 - 1{ //at last server in list
+            if at_server_idx[0] == config.servers.len() as u64 - 1{ 
                 at_server_idx[0] = 0;
             }else{
                 at_server_idx[0] += 1;
@@ -679,7 +680,9 @@ async fn check_and_ban_top_ip(max_per: u64) -> bool {
     if let Some((ip, count)) = entries.first() {
         if *count as u64 > max_per {
             RATE_LIMITS.remove(ip);
-            ban_list.write().await.push(ip.clone());
+            if !ban_list.read().await.contains(ip) {
+                ban_list.write().await.push(ip.clone());
+            }
             return true;
         }
     }
