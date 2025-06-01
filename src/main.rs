@@ -130,7 +130,7 @@ impl SlidingQuantile {
         if self.window.len() == self.max_size {
             self.window.pop_front();
         }
-        self.window.push_back(value); //vec![1, 1, 1, 2]
+        self.window.push_back(value.max(1)); //vec![1, 1, 1, 2]
     }
 
     fn quantile(&self, q: f64) -> u32 {
@@ -696,14 +696,18 @@ async fn clone_request(req: Request<Body>) -> Result<(Request<Body>, Request<Bod
 } 
 
 pub async fn build_cache_key(req: &mut Request<Body>) -> Result<String, anyhow::Error> {
+    dotenv().ok();
+
     let method = req.method().as_str();
     let uri = req.uri().to_string();
-
     let method = req.method().clone();
 
     let whole_body = to_bytes(req.body_mut()).await?;
-    let body_hash = Sha256::digest(&whole_body);
-    let body_digest = hex::encode(body_hash); 
+    let mut hasher = Sha256::new();
+    hasher.update(env::var("secret").unwrap_or(String::new()));
+    hasher.update(&whole_body);
+    let body_hash = hasher.finalize();
+    let body_digest = hex::encode(body_hash);
 
     *req.body_mut() = Body::from(whole_body);
 
