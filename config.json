@@ -6,10 +6,11 @@
     "health_check": 5,
     "health_check_path": "/",
 
-    "dos_sus_threshhold": 10 ,
+    "dos_sus_threshhold": 1 ,
 
     "ddos_cap": 150,
-    "ddos_grace_factor": 8,
+    "ddos_grace_factor": 0,
+    "dtp": 0.99,
 
     "ban_timeout": 300,
 
@@ -24,12 +25,8 @@
 
         {
             "ip": "http://localhost:8080",
-            "weight": 1,
             "is_active": true,
-            "res_time": 0, 
-
-            "strict_timeout": false,
-            "timeout_tick": 0
+            "strict_timeout": false
         } 
 
     ]

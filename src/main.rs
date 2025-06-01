@@ -41,11 +41,17 @@ struct IpStruct([u64; 4], u64);
 #[derive(Deserialize, Clone)]
 struct Server {
     ip: String,
+
+    #[serde(skip)]
     weight: u64,
     is_active: bool,
+
+    #[serde(skip)]
     res_time: u64,
 
     strict_timeout: bool,
+
+    #[serde(skip)]
     timeout_tick: u16,
 }
 
@@ -71,6 +77,7 @@ struct Config {
     challenge_url: String,
     Check_out: bool,
     Check_in: bool,
+    dtp: f64, //ddos threshold percentile
 }
 
 #[derive(Debug)]
@@ -95,7 +102,7 @@ static RATE_LIMITS: RateLimitMap = Lazy::new(|| {
 
 static MaxConcurrent: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0)); 
 
-fn dos(ip: String, threshhold: u64){
+fn dos(ip: String){
     let now = Instant::now();
 
     let mut entry = RATE_LIMITS.entry(ip.clone()).or_insert_with(|| AtomicU32::new(0));
@@ -133,8 +140,8 @@ impl SlidingQuantile {
         sorted.get(idx.min(sorted.len()-1)).cloned().unwrap_or(0)
     }
 
-    async fn is_anomaly(&self, current: u32, threshold: f64, cap: u64) -> bool {
-        let q = self.quantile(0.99).min(cap as u32);
+    async fn is_anomaly(&self, current: u32, threshold: f64, cap: u64, dtp: f64) -> bool {
+        let q = self.quantile(dtp).min(cap as u32);
         current as f64 > (q as f64) * threshold
     }
 }
@@ -148,7 +155,7 @@ async fn proxy(
     dos_threshhold: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
 
-    dos(origin_ip.clone(), dos_threshhold);
+    dos(origin_ip.clone());
 
    if ban_list.read().await.contains(&origin_ip.clone()){
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::DDoSsus)))
@@ -455,7 +462,7 @@ async fn main() {
                 last_ban_clear = Instant::now();
             }
 
-            if qg.is_anomaly(total as u32, cg.ddos_grace_factor, cg.ddos_cap).await {
+            if qg.is_anomaly(total as u32, cg.ddos_grace_factor, cg.ddos_cap, cg.dtp).await {
                 loop {
                     if !check_and_ban_top_ip(cg.dos_sus_threshhold).await {
                         break;
@@ -536,6 +543,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         challenge_url: String,
         Check_in: bool,
         Check_out: bool, 
+        dtp: f64,
     }
 
     let raw_config: RawConfig =
@@ -544,7 +552,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
     let servers = raw_config
         .servers
         .into_iter()
-        .map(|s| Arc::new(Mutex::new(s)))
+        .map(|mut s| {s.weight = 1; Arc::new(Mutex::new(s))})
         .collect();
 
     Ok(Config {
@@ -563,6 +571,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         Check_in: raw_config.Check_in,
         Check_out: raw_config.Check_out,
         servers,
+        dtp: raw_config.dtp,
     })
 }
 
