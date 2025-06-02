@@ -6,10 +6,10 @@
     "health_check": 5,
     "health_check_path": "/",
 
-    "dos_sus_threshhold": 0 ,
+    "dos_sus_threshhold": 10 ,
 
     "ddos_cap": 150,
-    "ddos_grace_factor": 0,
+    "ddos_grace_factor": 8,
     "dtp": 0.99,
 
     "ban_timeout": 300,

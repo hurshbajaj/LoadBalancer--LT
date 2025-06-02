@@ -345,8 +345,6 @@ async fn proxy(
                 }
                 // this can be intended by the server, don't mark as non-active
                 Err(_) => {
-                    println!("CHECK");
-                    println!("{:?}", target);
                     if count >= 1 {
                         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed)))
                     }
@@ -503,16 +501,13 @@ async fn main() {
                 if max_res_n.load(Ordering::SeqCst) as f64 > max_res_o.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_o.load(Ordering::SeqCst) != 1{
                     'outer: loop{
                         if at_port.load(Ordering::SeqCst) >= cg.max_port {
-                            println!("MAX PORT");
                             break 'outer;
                         }
                         at_port.fetch_add(1, Ordering::SeqCst);
                         if spawn_server(cg.bin_path.as_str()){
-                            println!("Making");
                             let mut NewS = cg.servers.last().unwrap().clone();
                             let mut newS = NewS.lock().await;
                             cg.servers.push(Arc::new(Mutex::new(Server{ip: increment_port(newS.ip.as_str()), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0})));
-                            println!("made");
                             break 'outer;
                         }
                     }
@@ -877,7 +872,6 @@ fn has_js_challenge_cookie(req: &Request<Body>) -> bool {
 }
 
 fn kill_server() -> anyhow::Result<()> {
-    println!("kill");
     let output = Command::new("lsof")
         .arg("-t")             
         .arg(format!("-i:{}", at_port.load(Ordering::SeqCst) as u16)) 
@@ -908,7 +902,6 @@ fn kill_server() -> anyhow::Result<()> {
 }
 
 fn spawn_server(bin_path: &str) -> bool {
-    println!("New server spawn!");
     let port = at_port.load(Ordering::SeqCst).to_string();
     let child = Command::new(bin_path)
         .arg("--port")
@@ -916,7 +909,6 @@ fn spawn_server(bin_path: &str) -> bool {
         .spawn()
         .is_ok();
 
-    println!("{:?}", port);
     child
 }
 
