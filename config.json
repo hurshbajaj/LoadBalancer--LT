@@ -24,7 +24,7 @@
     "dynamic": true,
     "server_spinup_rt_gf": 0.2, 
     "max_port": 6000,
-    "bin_path": "./dist/intrasudo25",
+    "bin_path": "./intrasudo25",
 
     "servers": [
 

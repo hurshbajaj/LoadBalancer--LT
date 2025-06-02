@@ -345,6 +345,8 @@ async fn proxy(
                 }
                 // this can be intended by the server, don't mark as non-active
                 Err(_) => {
+                    println!("CHECK");
+                    println!("{:?}", target);
                     if count >= 1 {
                         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed)))
                     }
@@ -415,7 +417,7 @@ async fn main() {
     let timeout_dur = config_guard.timeout_dur;
     let dos_thresh = config_guard.dos_sus_threshhold;
     let redis_port = config_guard.redis_server;
-    config_guard.servers.truncate(1);
+    config_guard.servers.drain(1..);
     at_port.store(Url::parse(config_guard.servers[0].lock().await.ip.as_str()).unwrap().port().unwrap() as u16, Ordering::SeqCst);
 
 
@@ -499,19 +501,19 @@ async fn main() {
 
             if cg.dynamic {
                 if max_res_n.load(Ordering::SeqCst) as f64 > max_res_o.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_o.load(Ordering::SeqCst) != 1{
-                    while true{
+                    'outer: loop{
                         if at_port.load(Ordering::SeqCst) >= cg.max_port {
                             println!("MAX PORT");
-                            break;
+                            break 'outer;
                         }
                         at_port.fetch_add(1, Ordering::SeqCst);
                         if spawn_server(cg.bin_path.as_str()){
-                            let mut newS = cg.servers.last().unwrap().clone();
-                            let mut g = newS.lock().await;
-                            g.ip = increment_port(g.ip.as_str());
-                            cg.servers.push(newS.clone());
+                            println!("Making");
+                            let mut NewS = cg.servers.last().unwrap().clone();
+                            let mut newS = NewS.lock().await;
+                            cg.servers.push(Arc::new(Mutex::new(Server{ip: increment_port(newS.ip.as_str()), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0})));
                             println!("made");
-                            break;
+                            break 'outer;
                         }
                     }
                 }
@@ -524,12 +526,12 @@ async fn main() {
                         }
                     }
                 }
+
             }
             
             max_res_o.store(max_res_n.load(Ordering::SeqCst), Ordering::SeqCst);
             max_res_n.store(1, Ordering::SeqCst);
 
-            println!("{:?}", cg.servers);
             Arc::clone(&RATE_LIMITS).clear();
         }
     });
@@ -564,11 +566,11 @@ async fn main() {
 
         }
     });
-
+/*
     let clientRun = tokio::spawn(async {
         CLIclient::establish().await;
     });
-
+*/
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
         panic!();
@@ -875,6 +877,7 @@ fn has_js_challenge_cookie(req: &Request<Body>) -> bool {
 }
 
 fn kill_server() -> anyhow::Result<()> {
+    println!("kill");
     let output = Command::new("lsof")
         .arg("-t")             
         .arg(format!("-i:{}", at_port.load(Ordering::SeqCst) as u16)) 
@@ -904,11 +907,17 @@ fn kill_server() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn spawn_server(bin_path: &str) ->  bool{
+fn spawn_server(bin_path: &str) -> bool {
     println!("New server spawn!");
-    Command::new(bin_path)
-        .arg(at_port.load(Ordering::SeqCst).to_string())
-        .spawn().is_ok()
+    let port = at_port.load(Ordering::SeqCst).to_string();
+    let child = Command::new(bin_path)
+        .arg("--port")
+        .arg(&port)
+        .spawn()
+        .is_ok();
+
+    println!("{:?}", port);
+    child
 }
 
 fn increment_port(url_str: &str) -> String {
