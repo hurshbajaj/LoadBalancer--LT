@@ -566,11 +566,11 @@ async fn main() {
 
         }
     });
-/*
+
     let clientRun = tokio::spawn(async {
         CLIclient::establish().await;
     });
-*/
+
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
         panic!();
@@ -927,5 +927,3 @@ fn increment_port(url_str: &str) -> String {
     url.to_string()
 }
 
-//test
-//push to master

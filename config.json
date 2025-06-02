@@ -6,10 +6,10 @@
     "health_check": 5,
     "health_check_path": "/",
 
-    "dos_sus_threshhold": 10 ,
+    "dos_sus_threshhold": 0 ,
 
     "ddos_cap": 150,
-    "ddos_grace_factor": 8,
+    "ddos_grace_factor": 0,
     "dtp": 0.99,
 
     "ban_timeout": 300,
@@ -22,7 +22,7 @@
     "challenge_url": "/js-challenge",
 
     "dynamic": true,
-    "server_spinup_rt_gf": 0.2, 
+    "server_spinup_rt_gf": 2, 
     "max_port": 6000,
     "bin_path": "./intrasudo25",
 
