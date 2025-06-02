@@ -1,6 +1,6 @@
 {
     "host": [[127, 0, 0, 1], 3000],
-    "redis_server": 7001,
+    "redis_server": 3001,
     "timeout_dur": 10,
 
     "health_check": 5,
@@ -21,10 +21,15 @@
     "js_challenge": true,
     "challenge_url": "/js-challenge",
 
+    "dynamic": true,
+    "server_spinup_rt_gf": 0.2, 
+    "max_port": 6000,
+    "bin_path": "./dist/intrasudo25",
+
     "servers": [
 
         {
-            "ip": "http://localhost:8080",
+            "ip": "http://localhost:5000",
             "is_active": true,
             "strict_timeout": false
         } 

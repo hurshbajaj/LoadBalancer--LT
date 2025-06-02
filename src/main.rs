@@ -2,14 +2,15 @@ use dashmap::DashMap;
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
-use std::{f64::MANTISSA_DIGITS, fs::File, io::Read, iter::from_fn, os::raw, str::FromStr, sync::{atomic::AtomicU64, Arc}, thread::{self, current}, time::{Duration, Instant}};
+use url::Url;
+use std::{f64::MANTISSA_DIGITS, fs::File, io::Read, iter::from_fn, os::raw, process::Command, str::FromStr, sync::{atomic::{AtomicU16, AtomicU64}, Arc}, thread::{self, current}, time::{Duration, Instant}};
 use tokio::{sync::{Mutex, MutexGuard}, time::{self, timeout}};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
 };
 use anyhow::{self, Context};
 use once_cell::sync::Lazy;
-use serde::{Deserialize};
+use serde::{de::Error, Deserialize};
 use serde_json;
 use std::collections::VecDeque;
 
@@ -32,13 +33,16 @@ static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new
 static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
 static max_res: Lazy<Mutex<u64>> =  Lazy::new(|| Mutex::new(1u64));
 
+static max_res_o:  Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+static max_res_n:  Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
+
 static atServerIdx: Lazy<Mutex<[u64; 2]>> = Lazy::new(|| Mutex::new([0u64, 0u64]));
 
 static ban_list: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(vec![])); 
 #[derive(Deserialize, Clone)]
 struct IpStruct([u64; 4], u64);
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 struct Server {
     ip: String,
 
@@ -72,12 +76,18 @@ struct Config {
     Method_hash_check: bool, 
     js_challenge: bool,
 
-    #[serde(skip)]
-    servers: Vec<Arc<Mutex<Server>>>,
+    dynamic: bool,
+    server_spinup_rt_gf: f64, //server spin up restime grace factor
+
     challenge_url: String,
     Check_out: bool,
     Check_in: bool,
     dtp: f64, //ddos threshold percentile
+
+    #[serde(skip)]
+    servers: Vec<Arc<Mutex<Server>>>,
+    bin_path: String,
+    max_port: u16,
 }
 
 #[derive(Debug)]
@@ -101,6 +111,8 @@ static RATE_LIMITS: RateLimitMap = Lazy::new(|| {
 });
 
 static MaxConcurrent: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0)); 
+
+static at_port: Lazy<AtomicU16> = Lazy::new(|| AtomicU16::new(0));
 
 fn dos(ip: String){
     let now = Instant::now();
@@ -286,6 +298,9 @@ async fn proxy(
                     if start.elapsed().as_millis() as u64 > *max as u64 {
                         *max = start.elapsed().as_millis() as u64;
                     }
+                    if start.elapsed().as_millis() as u64 > max_res_n.load(Ordering::SeqCst){
+                        max_res_n.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
+                    }
                     target.res_time = ((start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
 
                     // cache
@@ -396,18 +411,28 @@ async fn main() {
         *TARGET.lock().await = Some(server);
     }
 
-    let config_guard = CONFIG.lock().await;
+    let mut config_guard = CONFIG.lock().await;
     let timeout_dur = config_guard.timeout_dur;
     let dos_thresh = config_guard.dos_sus_threshhold;
     let redis_port = config_guard.redis_server;
+    config_guard.servers.truncate(1);
+    at_port.store(Url::parse(config_guard.servers[0].lock().await.ip.as_str()).unwrap().port().unwrap() as u16, Ordering::SeqCst);
 
-    drop(config_guard);
 
     let redis_client = redis::Client::open(format!("redis://127.0.0.1:{redis_port}/"), ).unwrap(); 
     let con = Arc::new(Mutex::new(redis_client.get_async_connection().await.unwrap()));
 
-    let addr = ([127, 0, 0, 1], 3000).into();
+    let ip_mk = [
+        config_guard.host.0[0] as u8,
+        config_guard.host.0[1] as u8,
+        config_guard.host.0[2] as u8,
+        config_guard.host.0[3] as u8,
+    ];
+    let port_mk = config_guard.host.1 as u16;
+    let addr = (ip_mk, port_mk).into();
     let client = Arc::new(Client::new());
+
+    drop(config_guard);
 
     let make_svc = make_service_fn(move |conn: &hyper::server::conn::AddrStream| {
         let remote_addr = conn.remote_addr().to_string();
@@ -445,7 +470,7 @@ async fn main() {
 
     let server = HyperServer::bind(&addr).serve(make_svc);
 
-    let clear_dos = tokio::spawn(async {
+    let ps = tokio::spawn(async {
         let quant = Arc::new(Mutex::new(SlidingQuantile::new(100)));
         let mut last_ban_clear = Instant::now(); // keep track of last ban_list clear time
 
@@ -455,7 +480,7 @@ async fn main() {
             let total = RATE_LIMITS.iter().map(|v| v.value().load(Ordering::SeqCst)).sum::<u32>() as u64;
             let qg_arc = Arc::clone(&quant);
             let mut qg = qg_arc.lock().await;
-            let cg = CONFIG.lock().await;
+            let mut cg = CONFIG.lock().await;
 
             if last_ban_clear.elapsed().as_secs() >= cg.ban_timeout {
                 ban_list.write().await.clear();
@@ -472,6 +497,39 @@ async fn main() {
                 qg.record(total as u32);
             }
 
+            if cg.dynamic {
+                if max_res_n.load(Ordering::SeqCst) as f64 > max_res_o.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_o.load(Ordering::SeqCst) != 1{
+                    while true{
+                        if at_port.load(Ordering::SeqCst) >= cg.max_port {
+                            println!("MAX PORT");
+                            break;
+                        }
+                        at_port.fetch_add(1, Ordering::SeqCst);
+                        if spawn_server(cg.bin_path.as_str()){
+                            let mut newS = cg.servers.last().unwrap().clone();
+                            let mut g = newS.lock().await;
+                            g.ip = increment_port(g.ip.as_str());
+                            cg.servers.push(newS.clone());
+                            println!("made");
+                            break;
+                        }
+                    }
+                }
+
+                if max_res_o.load(Ordering::SeqCst) as f64 > max_res_n.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_n.load(Ordering::SeqCst) != 1{ 
+                    if cg.servers.len() > 1{
+                        if kill_server().is_ok() {
+                            cg.servers.last().unwrap().lock().await;
+                            cg.servers.pop();
+                        }
+                    }
+                }
+            }
+            
+            max_res_o.store(max_res_n.load(Ordering::SeqCst), Ordering::SeqCst);
+            max_res_n.store(1, Ordering::SeqCst);
+
+            println!("{:?}", cg.servers);
             Arc::clone(&RATE_LIMITS).clear();
         }
     });
@@ -543,7 +601,11 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         challenge_url: String,
         Check_in: bool,
         Check_out: bool, 
+        dynamic: bool,
+        server_spinup_rt_gf: f64,
         dtp: f64,
+        max_port: u16,
+        bin_path: String,
     }
 
     let raw_config: RawConfig =
@@ -572,6 +634,11 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         Check_out: raw_config.Check_out,
         servers,
         dtp: raw_config.dtp,
+        dynamic: raw_config.dynamic,
+        server_spinup_rt_gf: raw_config.server_spinup_rt_gf,
+        max_port: raw_config.max_port,
+        bin_path: raw_config.bin_path,
+        
     })
 }
 
@@ -806,3 +873,50 @@ fn has_js_challenge_cookie(req: &Request<Body>) -> bool {
     }
     false
 }
+
+fn kill_server() -> anyhow::Result<()> {
+    let output = Command::new("lsof")
+        .arg("-t")             
+        .arg(format!("-i:{}", at_port.load(Ordering::SeqCst) as u16)) 
+        .output()?;            
+
+    if output.status.success() {
+        let pids = String::from_utf8_lossy(&output.stdout);
+        let mut status: Option<std::process::ExitStatus> = None;
+
+        for pid in pids.lines() {
+            status = Some(Command::new("kill")
+                .arg("-9")        
+                .arg(pid)
+                .status()?);       
+        }
+        if status.is_some(){
+            if status.unwrap().success(){
+                at_port.fetch_sub(1, Ordering::SeqCst);
+            }else{
+                return Err(anyhow::Error::msg(""));
+            }
+        }else{
+            return Err(anyhow::Error::msg(""));
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_server(bin_path: &str) ->  bool{
+    println!("New server spawn!");
+    Command::new(bin_path)
+        .arg(at_port.load(Ordering::SeqCst).to_string())
+        .spawn().is_ok()
+}
+
+fn increment_port(url_str: &str) -> String {
+    let mut url = Url::parse(url_str).unwrap();
+    let port = url.port().unwrap();
+    url.set_port(Some(port + 1)).unwrap();
+    url.to_string()
+}
+
+//test
+//push to master

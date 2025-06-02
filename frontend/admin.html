@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0D0E11">
+    <meta name="description" content="Admin Dashboard for Intra Sudo 2025">
+    <title>Admin Dashboard - Intra Sudo 2025</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="css/base.css">
+    <link rel="stylesheet" href="css/components.css">
+    <link rel="stylesheet" href="css/admin.css">
+    <link rel="icon" type="image/x-icon" href="assets/favicon.ico">
+</head>
+<body class="scrollable-page">
+    <nav class="navbar">
+        <div class="nav-left">
+            <a href="/" class="logo-link">
+                <img class="logo-img" src="assets/logo-blue.png" alt="Sudocrypt" />
+                <div class="logo-notification" id="logoNotification" style="display: none;"></div>
+                <span class="nav-brand">Intra Sudo v6.0</span>
+            </a>
+            <button class="mobile-menu-toggle" onclick="toggleMobileMenu()">
+                <img src="assets/logo_nobg.png" alt="Menu" class="mobile-menu-icon">
+            </button>
+        </div>
+        <div class="nav-center">
+            <a href="/home" class="nav-link">Home</a>
+            <a href="/leaderboard" class="nav-link">Leaderboard</a>
+            <a href="/hints" class="nav-link">Hints</a>
+        </div>
+        <div class="nav-right">
+            <a href="/admin" class="nav-link active" id="adminLink">
+                Admin
+            </a>
+            <a href="#" class="nav-link" onclick="handleLogout()">Log Out</a>
+        </div>
+    </nav>
+
+    <div class="mobile-nav-menu" id="mobileNavMenu">
+        <div class="mobile-nav-links">
+            <a href="/home" class="nav-link">Home</a>
+            <a href="/leaderboard" class="nav-link">Leaderboard</a>
+            <a href="/hints" class="nav-link">Hints</a>
+            <a href="/admin" class="nav-link active" id="mobileAdminLink">Admin</a>
+            <a href="#" class="nav-link" onclick="handleLogout()">Log Out</a>
+        </div>
+    </div>
+
+    <div class="page-container">
+        <div class="main-content-pages">
+            <div class="admin-content">
+                <div class="admin-container">
+                <header class="admin-header">
+                    <h1 class="admin-title">Admin Dashboard</h1>
+                </header>
+
+                <div class="admin-dashboard">
+
+                    <section class="admin-section">
+                        <div class="section-header">
+                            <h2 class="section-title">System Overview</h2>
+                        </div>
+                        <div class="stats-grid" id="statsGrid">
+                            <div class="stat-card">
+                                <div class="stat-value" id="totalUsers">-</div>
+                                <div class="stat-label">Total Users</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-value" id="totalLevels">-</div>
+                                <div class="stat-label">Total Levels</div>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="admin-section">
+                        <div class="section-header">
+                            <h2 class="section-title">Level Management</h2>
+                            <button class="btn-primary" onclick="toggleAddLevelForm()">
+                                Add New Level
+                            </button>
+                        </div>
+
+                        <div class="add-level-form" id="addLevelForm">
+                            <div class="form-group">
+                                <label class="form-label" for="levelNumber">Level Number:</label>
+                                <input type="number" id="levelNumber" class="form-input" placeholder="Enter level number" min="1">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Level Questions:</label>
+                                <div id="questionsContainer">
+                                    <div class="question-input-group">
+                                        <textarea class="form-input form-textarea level-question" placeholder="Enter the level question or description"></textarea>
+                                        <button type="button" class="btn-add-question" onclick="addQuestionInput()">+</button>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="levelAnswer">Correct Answer:</label>
+                                <input type="text" id="levelAnswer" class="form-input" placeholder="Enter the correct answer">
+                            </div>
+                            <div class="form-actions">
+                                <button class="btn-secondary" onclick="cancelAddLevel()">Cancel</button>
+                                <button class="btn-primary" onclick="createLevel()">Create Level</button>
+                            </div>
+                        </div>
+
+                        <div class="add-level-form" id="editLevelForm" style="display: none;">
+                            <h3>Edit Level</h3>
+                            <div class="form-group">
+                                <label class="form-label" for="editLevelNumber">Level Number:</label>
+                                <input type="number" id="editLevelNumber" class="form-input" placeholder="Enter level number" min="1">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Level Questions:</label>
+                                <div id="editQuestionsContainer">
+                                    <div class="question-input-group">
+                                        <textarea class="form-input form-textarea level-question" placeholder="Enter the level question or description"></textarea>
+                                        <button type="button" class="btn-add-question" onclick="addEditQuestionInput()">+</button>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label" for="editLevelAnswer">Correct Answer:</label>
+                                <input type="text" id="editLevelAnswer" class="form-input" placeholder="Enter the correct answer">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">
+                                    <input type="checkbox" id="editLevelActive"> Active
+                                </label>
+                            </div>
+                            <div class="form-actions">
+                                <button class="btn-secondary" onclick="cancelEditLevel()">Cancel</button>
+                                <button class="btn-primary" onclick="updateLevel()">Update Level</button>
+                            </div>
+                        </div>
+
+                        <div id="levelsContainer">
+                            <div class="loading-state" id="levelsLoading">Loading levels...</div>
+                            <div class="level-list" id="levelsList" style="display: none;"></div>
+                            <div class="empty-state" id="levelsEmpty" style="display: none;">
+                                <div class="empty-state-icon">?</div>
+                                <p>No levels found. Create your first level to get started!</p>
+                            </div>
+                        </div>
+                    </section>
+
+                    <section class="admin-section" id="questionStateSection" style="display: none;">
+                        <div class="section-header">
+                            <h2 class="section-title">Question State Management</h2>
+                            <div class="section-actions">
+                                <button class="btn-primary" onclick="toggleAllQuestions(true)">
+                                    Enable All
+                                </button>
+                                <button class="btn-danger" onclick="toggleAllQuestions(false)">
+                                    Disable All
+                                </button>
+                            </div>
+                        </div>
+                        <div id="questionStateContainer">
+                            <div class="question-state-list" id="questionStateList"></div>
+                        </div>
+                    </section>
+
+                    <section class="admin-section">
+                        <div class="section-header">
+                            <h2 class="section-title">User Management</h2>
+                            <button class="btn-primary" onclick="refreshUsers()">
+                                Refresh
+                            </button>
+                        </div>
+                        <div id="usersContainer">
+                            <div class="loading-state">Loading users...</div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="js/utils.js"></script>
+    <script src="js/admin.js"></script>
+
+    <div class="confirm-modal" id="confirmModal">
+        <div class="confirm-modal-content">
+            <div class="confirm-modal-header">
+                <h3 id="confirmTitle">Confirmation</h3>
+                <button class="confirm-close-btn" onclick="closeConfirmModal()">&times;</button>
+            </div>
+            <div class="confirm-modal-body">
+                <p id="confirmMessage">Are you sure you want to perform this action?</p>
+            </div>
+            <div class="confirm-modal-footer">
+                <button class="btn-secondary confirm-btn" onclick="closeConfirmModal()">Cancel</button>
+                <button class="btn-primary confirm-btn" id="confirmActionBtn" onclick="confirmAction()">Confirm</button>
+            </div>
+                </div>
+            </div>
+        </div>
+    </div>
+        </div>
+    </div>
+
+    <style>
+        @keyframes slideInRight {
+            from {
+                opacity: 0;
+                transform: translateX(100%);
+            }
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        @keyframes slideOutRight {
+            from {
+                opacity: 1;
+                transform: translateX(0);
+            }
+            to {
+                opacity: 0;
+                transform: translateX(100%);
+            }
+        }
+
+        /* Admin Dashboard Styles */
+        .admin-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        .admin-header {
+            text-align: center;
+            margin-bottom: 3rem;
+        }
+
+        .admin-title {
+            font-size: 2.5rem;
+            margin-bottom: 0.5rem;
+            color: #333;
+        }
+
+        .admin-subtitle {
+            color: #666;
+            font-size: 1.1rem;
+        }
+
+        .admin-section {
+            background: rgba(13, 14, 17, 0.8) !important;
+            border: 1px solid rgba(255, 255, 255, 0.15) !important;
+            border-radius: 12px;
+            padding: 2rem;
+            margin-bottom: 2rem;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+        }
+
+        .section-title {
+            font-size: 1.5rem;
+            margin: 0;
+            color: #333;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.5rem;
+        }
+
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 1.5rem;
+            border-radius: 8px;
+            text-align: center;
+            color: white;
+        }
+
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-label {
+            font-size: 0.9rem;
+            opacity: 0.9;
+        }
+
+        .add-level-form {
+            display: none;
+            background: #f8f9fa;
+            padding: 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 2rem;
+            border: 2px dashed #ddd;
+        }
+
+        .add-level-form.show {
+            display: block;
+        }
+
+        .form-group {
+            margin-bottom: 1rem;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            font-size: 1rem;
+        }
+
+        .form-textarea {
+            min-height: 100px;
+            resize: vertical;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: #007bff;
+        }
+
+        .form-actions {
+            display: flex;
+            gap: 1rem;
+            margin-top: 1rem;
+        }
+
+        .btn-primary, .btn-secondary, .btn-danger {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .btn-primary {
+            background: #007bff;
+            color: white;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: #0056b3;
+        }
+
+        .btn-secondary:hover {
+            background: #545b62;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .level-list, .user-list {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+
+        .level-item, .user-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1.5rem;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background: #f9f9f9;
+        }
+
+        .level-info, .user-info {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            flex: 1;
+        }
+
+        .level-number {
+            background: #007bff;
+            color: white;
+            padding: 0.5rem 1rem;
+            border-radius: 50%;
+            font-weight: bold;
+            min-width: 40px;
+            text-align: center;
+        }
+
+        .level-title, .user-name {
+            margin: 0 0 0.5rem 0;
+            color: #333;
+        }
+
+        .level-description {
+            margin: 0;
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        .level-meta {
+            margin-top: 0.5rem;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 500;
+        }
+
+        .status-active {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status-inactive {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .level-actions, .user-actions {
+            display: flex;
+            gap: 0.5rem;
+        }
+
+        .loading-state, .empty-state, .error-state {
+            text-align: center;
+            padding: 3rem;
+            color: #666;
+        }
+
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+        }
+
+        .user-details p {
+            margin: 0.25rem 0;
+            font-size: 0.9rem;
+        }
+
+        .user-status.verified {
+            color: #28a745;
+        }
+
+        .user-status.unverified {
+            color: #dc3545;
+        }
+
+        .user-admin {
+            color: #ffc107;
+            font-weight: 600;
+        }
+
+        @media (max-width: 768px) {
+            .level-item, .user-item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 1rem;
+            }
+
+            .level-actions, .user-actions {
+                width: 100%;
+                justify-content: flex-end;
+            }
+        }
+
+        /* Confirmation Modal Styles */
+        .confirm-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.7);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+        }
+
+        .confirm-modal.show {
+            opacity: 1;
+            pointer-events: auto;
+        }
+
+        .confirm-modal-content {
+            background: #fff;
+            border-radius: 8px;
+            overflow: hidden;
+            width: 90%;
+            max-width: 500px;
+            animation: slideInRight 0.3s forwards;
+        }
+
+        .confirm-modal-header {
+            background: #007bff;
+            color: white;
+            padding: 1rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .confirm-modal-body {
+            padding: 1.5rem;
+        }
+
+        .confirm-modal-footer {
+            padding: 1rem;
+            display: flex;
+            justify-content: flex-end;
+            gap: 1rem;
+        }
+
+        .confirm-close-btn {
+            background: transparent;
+            border: none;
+            color: white;
+            font-size: 1.5rem;
+            cursor: pointer;
+        }
+
+        .confirm-btn {
+            padding: 0.75rem 1.5rem;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1rem;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .confirm-btn:hover {
+            opacity: 0.9;
+        }
+    </style>
+    
+    <footer class="page-footer">
+        <div class="footer-content">
+            <p class="footer-text">&copy; Exun Clan</p>
+            <p class="footer-text">The Computer Club of Delhi Public School, R.K. Puram</p>
+        </div>
+    </footer>
+</body>
+</html>

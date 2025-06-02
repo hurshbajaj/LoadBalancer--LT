@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0D0E11">
+    <meta name="description" content="Website for Exun Intra Sudo 2025">
+    <title>Login - Intra Sudo 2025</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="css/base.css">
+    <link rel="stylesheet" href="css/components.css">
+    <link rel="stylesheet" href="css/forms.css">
+    <link rel="icon" href="assets/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="page-container">
+        <main class="main-content-pages">
+            <div class="content-card auth-card">
+                <div class="card-header">
+                    <img src="assets/logo-blue.png" alt="Sudocrypt Logo" class="auth-logo">
+                    <h1 class="card-title">Welcome to Intra Sudo v6.0</h1>
+                    <p class="auth-subtitle">Enter your email to receive a verification code</p>
+                </div>
+                
+                <div class="card-content">
+
+                    <form class="auth-form" id="email-form" style="display: block;">
+                        <div class="auth-field">
+                            <input type="email" id="email" name="email" class="auth-input" placeholder="Enter your email address" required>
+                        </div>
+                        
+                        <button type="submit" class="auth-button" id="emailButton">
+                            <span id="emailButtonText">Get Login Code</span>
+                        </button>
+                        
+                        <div class="auth-error" id="emailError" style="display: none;"></div>
+                    </form>
+                    
+
+                    <form class="auth-form" id="code-form" style="display: none;">
+                        <div class="auth-field">
+                            <input type="text" id="verification-code" name="verification-code" class="auth-input" placeholder="Enter your 4-digit login code" maxlength="4" required>
+                            <small class="auth-helper centered">Check your email for your permanent 4-digit login code</small>
+                        </div>
+                        
+                        <button type="submit" class="auth-button" id="codeButton">
+                            <span id="codeButtonText">Sign In</span>
+                        </button>
+                        
+                        <button type="button" class="auth-button-secondary" id="backButton">
+                            <span>Back</span>
+                        </button>
+                        
+                        <div class="auth-error" id="codeError" style="display: none;"></div>
+                    </form>
+                    
+                    <div class="auth-footer">
+                        <a href="/landing" class="auth-back">
+                            Back to landing
+                        </a>
+                    </div>
+                    
+                    <div class="auth-info">
+                        <p>New to Intra Sudo? Contact the organizing team for registration.</p>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+
+    <div class="auth-modal" id="authModal">
+        <div class="auth-modal-window">
+            <h3 class="auth-modal-title" id="authModalTitle">Notice</h3>
+            <p class="auth-modal-message" id="authModalMessage">Message here</p>
+            <button class="auth-modal-button" id="authModalOkButton">OK</button>
+        </div>
+    </div>
+    
+    <script src="js/auth.js"></script>
+
+    <style>
+    .auth-modal {
+        display: none;
+        position: fixed;
+        z-index: 1000;
+        left: 0;
+        top: 0;
+        width: 100vw;
+        height: 100vh;
+        background: none !important;
+        opacity: 1 !important;
+        justify-content: center;
+        align-items: center;
+    }
+    .auth-modal.show {
+        display: flex;
+    }
+    .auth-modal-window {
+        background: #181a20 !important;
+        color: #fff;
+        border-radius: 12px;
+        box-shadow: 0 8px 40px 0 rgba(0,0,0,0.65), 0 0 0 2px #2977f5;
+        padding: 2rem 2.5rem;
+        min-width: 320px;
+        max-width: 90vw;
+        text-align: center;
+        border: 1.5px solid #2977f5;
+        outline: 0.5px solid #2977f5;
+        backdrop-filter: none !important;
+        opacity: 1 !important;
+    }
+    .auth-modal-title {
+        font-size: 1.3rem;
+        font-weight: 600;
+        margin-bottom: 0.75rem;
+        color: #2977f5;
+    }
+    .auth-modal-message {
+        font-size: 1rem;
+        margin-bottom: 1.5rem;
+        color: #e0e0e0;
+    }
+    .auth-modal-button {
+        background: #2977f5;
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 0.6rem 1.5rem;
+        font-size: 1rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background 0.2s;
+    }
+    .auth-modal-button:hover {
+        background: #1e5fd9;
+    }
+    </style>
+    
+    <footer class="page-footer">
+        <div class="footer-content">
+            <p class="footer-text">&copy; Exun Clan</p>
+            <p class="footer-text">The Computer Club of Delhi Public School, R.K. Puram</p>
+        </div>
+    </footer>
+</body>
+</html>
