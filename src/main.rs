@@ -532,6 +532,7 @@ async fn main() {
     });
 
     let healthCheck = tokio::spawn(async move {
+        /*
 
         let client = Arc::new(Client::new());
         let config_guard = CONFIG.lock().await;
@@ -559,6 +560,42 @@ async fn main() {
 
             reorder().await.unwrap();
 
+        }
+        */
+        let (client, timeout_dur, servers, path, health_interval) = {
+            let config = CONFIG.lock().await;
+
+            (
+                Arc::new(Client::new()),
+                config.timeout_dur,
+                config.servers.clone(),
+                config.health_check_path.clone(),
+                config.health_check,
+            )
+        };
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(health_interval)).await;
+
+            let mut tasks = vec![];
+
+            for server in servers.clone() {
+                let client = client.clone();
+                let path = path.clone();
+                let srv = server.clone();
+
+                tasks.push(tokio::spawn(async move {
+                    health_check_proxy(client, timeout_dur, srv, path).await;
+                }));
+            }
+
+            for task in tasks {
+                let _ = task.await;
+            }
+
+            if let Err(e) = reorder().await {
+                eprintln!("Failed to reorder servers after health check: {:?}", e);
+            }
         }
     });
 
@@ -638,7 +675,7 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         
     })
 }
-
+/*
 async fn updateTARGET() -> anyhow::Result<()> {
 
     let target_arc = {
@@ -697,7 +734,82 @@ async fn updateTARGET() -> anyhow::Result<()> {
 
     Ok(())
 }
+*/
 
+async fn updateTARGET() -> anyhow::Result<()> {
+    let (servers, mut at_idx) = {
+        let config = CONFIG.lock().await;
+        let mut at_server_idx = atServerIdx.lock().await;
+
+        if config.servers.is_empty() {
+            return Err(anyhow::anyhow!("No servers available in config."));
+        }
+
+        if at_server_idx[1] >= config.servers[at_server_idx[0] as usize].lock().await.weight {
+            at_server_idx[1] = 0;
+            at_server_idx[0] = (at_server_idx[0] + 1) % config.servers.len() as u64;
+        } else {
+            at_server_idx[1] += 1;
+        }
+
+        (config.servers.clone(), *at_server_idx)
+    };
+
+    let mut found_healthy = false;
+    let mut checked = 0;
+    let mut current_idx = at_idx[0];
+
+    while !found_healthy && checked < servers.len() {
+        let server = servers[current_idx as usize].clone();
+        {
+            let server_guard = server.lock().await;
+            if server_guard.is_active {
+                found_healthy = true;
+            }
+        } // <- ✅ drop `server_guard` here
+
+        if found_healthy {
+            *TARGET.lock().await = Some(server);
+            let mut at_server_idx = atServerIdx.lock().await;
+            *at_server_idx = [current_idx, 0];
+            return Ok(());
+        }
+
+        current_idx = (current_idx + 1) % servers.len() as u64;
+        checked += 1;
+    }
+
+    Err(anyhow::anyhow!(format_error_type(ErrorTypes::NoHealthyServerFound)))
+}
+
+
+async fn reorder() -> anyhow::Result<()> {
+    let servers_snapshot = {
+        let config = CONFIG.lock().await;
+        config.servers.clone()
+    };
+
+    let mut weighted_servers: Vec<(u64, Arc<Mutex<Server>>)> = Vec::new();
+
+    for server_arc in &servers_snapshot {
+        let server = server_arc.lock().await;
+        let weight = if server.is_active { server.weight } else { 0 };
+        weighted_servers.push((weight, server_arc.clone()));
+    }
+
+    weighted_servers.sort_by(|a, b| b.0.cmp(&a.0));
+
+    {
+        let mut config = CONFIG.lock().await;
+        config.servers = weighted_servers.into_iter().map(|(_, srv)| srv).collect();
+    }
+
+    let mut idx = atServerIdx.lock().await;
+    *idx = [0, 0];
+
+    Ok(())
+}
+/*
 async fn reorder() -> anyhow::Result<()> {
     let mut config = CONFIG.lock().await;
 
@@ -723,7 +835,7 @@ async fn reorder() -> anyhow::Result<()> {
 
     Ok(())
 }
-
+*/
 async fn clone_request(req: Request<Body>) -> Result<(Request<Body>, Request<Body>), hyper::Error> {
 
     let (parts, body) = req.into_parts();
