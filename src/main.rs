@@ -1041,5 +1041,3 @@ fn kill_socket(path: &str) -> anyhow::Result<()> {
     at_port.fetch_sub(1, Ordering::SeqCst);
     Ok(())
 }
-
-
