@@ -532,36 +532,7 @@ async fn main() {
     });
 
     let healthCheck = tokio::spawn(async move {
-        /*
 
-        let client = Arc::new(Client::new());
-        let config_guard = CONFIG.lock().await;
-        let timeout_dur = config_guard.timeout_dur;
-
-        let ip = config_guard.host.clone();
-
-        let uri = format!("http://{}.{}.{}.{}:{}/", ip.0[0], ip.0[1], ip.0[2], ip.0[3], ip.1);
-
-        let servers = config_guard.servers.clone();
-
-        let health_check = config_guard.health_check;
-
-        let health_check_path = config_guard.health_check_path.clone();
-        drop(config_guard);
-
-        loop {
-            tokio::time::sleep(Duration::from_secs(health_check)).await;
-
-            let mut Servers = servers.clone();
-
-            for server in Servers {
-                health_check_proxy(client.clone(), timeout_dur.clone(), server, health_check_path.clone()).await;
-            }
-
-            reorder().await.unwrap();
-
-        }
-        */
         let (client, timeout_dur, servers, path, health_interval) = {
             let config = CONFIG.lock().await;
 
@@ -809,33 +780,7 @@ async fn reorder() -> anyhow::Result<()> {
 
     Ok(())
 }
-/*
-async fn reorder() -> anyhow::Result<()> {
-    let mut config = CONFIG.lock().await;
 
-    let mut weighted_servers: Vec<(u64, Arc<Mutex<Server>>)> = Vec::new();
-
-    for server_arc in &config.servers {
-        let server = server_arc.lock().await;
-        if server.is_active {
-            weighted_servers.push((server.weight, server_arc.clone()));
-        } else {
-            weighted_servers.push((0, server_arc.clone()));
-        }
-    }
-
-    weighted_servers.sort_by(|a, b| b.0.cmp(&a.0));
-
-    config.servers = weighted_servers.into_iter().map(|(_, srvr)| srvr).collect();
-
-    drop(config);
-
-    let mut at_server_idx = atServerIdx.lock().await;
-    *at_server_idx = [0, 0];
-
-    Ok(())
-}
-*/
 async fn clone_request(req: Request<Body>) -> Result<(Request<Body>, Request<Body>), hyper::Error> {
 
     let (parts, body) = req.into_parts();
