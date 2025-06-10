@@ -21,5 +21,3 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - Method Hash Verification (HMAC) | JS challenge
 - IPC support
 <hr>
-
-*3* 
