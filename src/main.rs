@@ -3,7 +3,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode};
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
 use url::Url;
-use std::{f64::MANTISSA_DIGITS, fs::File, io::Read, iter::from_fn, os::raw, process::Command, str::FromStr, sync::{atomic::{AtomicU16, AtomicU64}, Arc}, thread::{self, current}, time::{Duration, Instant}};
+use std::{f64::MANTISSA_DIGITS, fs::{self, File}, io::Read, iter::from_fn, os::raw, process::Command, str::FromStr, sync::{atomic::{AtomicU16, AtomicU64}, Arc}, thread::{self, current}, time::{Duration, Instant}};
 use tokio::{sync::{Mutex, MutexGuard}, time::{self, timeout}};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
@@ -15,6 +15,7 @@ use serde_json;
 use std::collections::VecDeque;
 
 use futures::future::join_all;
+use hyperlocal::{UnixClientExt, UnixConnector, Uri as local_uri};
 
 use std::env;
 use dotenv::dotenv;
@@ -88,6 +89,8 @@ struct Config {
     servers: Vec<Arc<Mutex<Server>>>,
     bin_path: String,
     max_port: u16,
+    ipc_path: String,
+    ipc: bool,
 }
 
 #[derive(Debug)]
@@ -160,7 +163,7 @@ impl SlidingQuantile {
 
 async fn proxy(
     mut req: Request<Body>,
-    client: Arc<Client<HttpConnector>>,
+    client: client_type,
     origin_ip: String,
     timeout_dur: u64,
     redis_conn: Arc<Mutex<redis::aio::Connection>>,
@@ -260,18 +263,33 @@ async fn proxy(
         let target_arc = guard.clone().unwrap();
         let mut target = target_arc.lock().await;
 
-        let new_uri = format!(
-            "{}{}",
-            target.ip,
-            req_clone.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/")
-        )
-        .parse::<Uri>()
-        .expect("Failed to parse URI");
+        let mut proxied_req = Request::builder();
 
-        let mut proxied_req = Request::builder()
-            .method(req_clone.method())
-            .uri(new_uri)
-            .version(req_clone.version());
+        let (ipc, path) = {
+            let g = CONFIG.lock().await;
+            (g.ipc.clone(), g.ipc_path.clone())
+        };
+
+        if ipc{
+            let urii: hyper::Uri = local_uri::new(target.ip.clone(), req_clone.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/")).into();
+            proxied_req = Request::builder()
+                .method(req_clone.method())
+                .uri(urii)
+                .version(req_clone.version());
+        }else{
+            let new_uri = format!(
+                "{}{}",
+                target.ip,
+                req_clone.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/")
+            )
+                .parse::<Uri>()
+                .expect("Failed to parse URI");
+
+            proxied_req = Request::builder()
+                .method(req_clone.method())
+                .uri(new_uri)
+                .version(req_clone.version());
+        }
 
         for (key, value) in req_clone.headers() {
             proxied_req = proxied_req.header(key, value);
@@ -288,7 +306,13 @@ async fn proxy(
             .expect("Failed to build request");
 
         let start = Instant::now();
-        let timeout_result = timeout(Duration::from_secs(timeout_dur), client.request(proxied_req)).await;
+
+        let mut timeout_result;
+
+        match client{
+            client_type::Http(ref x) => {timeout_result = timeout(Duration::from_secs(timeout_dur), x.request(proxied_req)).await;},
+            client_type::Ipc(ref x) => {timeout_result = timeout(Duration::from_secs(timeout_dur), x.request(proxied_req)).await;},
+        }
 
         match timeout_result {
             Ok(result) => match result {
@@ -368,7 +392,7 @@ async fn proxy(
 }
 
 async fn health_check_proxy(
-    client: Arc<Client<HttpConnector>>,
+    client: client_type,
     timeout_dur: u64,
     server: Arc<Mutex<Server>>,
     health_check_path: String
@@ -377,9 +401,42 @@ async fn health_check_proxy(
     let target_arc = server.clone();
     let mut target = target_arc.lock().await; 
 
-    let req = Request::builder().uri(format!("{}{}", target.ip.clone(), health_check_path)).method("GET").body(Body::empty()).unwrap();
+    let mut req = Request::builder().body(Body::empty()).unwrap();
 
-    let timeout_result = timeout(Duration::from_secs(timeout_dur), client.request(req)).await;
+    let ipc = {
+        let g = CONFIG.lock().await;
+        g.ipc.clone()
+    };
+
+    if ipc{
+        let urii: hyper::Uri = local_uri::new(target.ip.clone(), health_check_path.as_str()).into();
+        req = Request::builder()
+            .method("GET")
+            .uri(urii)
+            .body(Body::empty())
+            .unwrap();
+    }else{
+        let new_uri = format!(
+            "{}{}",
+            target.ip,
+            health_check_path
+            )
+            .parse::<Uri>()
+            .expect("Failed to parse URI");
+
+        req = Request::builder()
+            .method("GET")
+            .uri(new_uri)
+            .body(Body::empty())
+            .unwrap();
+    }
+
+    let timeout_result;
+
+    match client{
+        client_type::Http(ref x) => {timeout_result = timeout(Duration::from_secs(timeout_dur), x.request(req)).await;},
+        client_type::Ipc(ref x) => {timeout_result = timeout(Duration::from_secs(timeout_dur), x.request(req)).await;},
+    }
 
     match timeout_result {
         Ok(result) => match result {
@@ -394,13 +451,17 @@ async fn health_check_proxy(
             Err(_) => {target.is_active = false; Err(anyhow::Error::msg(format_error_type(ErrorTypes::HealthCheckFailed)))}, 
         },
         Err(_) => {
-            
             target.is_active = false;
             Err(anyhow::Error::msg(format_error_type(ErrorTypes::TimeoutError)))
         }
     }
 }
 
+#[derive(Clone)]
+enum client_type{
+    Http(Arc<Client<HttpConnector, Body>>),
+    Ipc(Arc<Client<UnixConnector, Body>>)
+}
 
 #[tokio::main]
 async fn main() {
@@ -416,8 +477,12 @@ async fn main() {
     let dos_thresh = config_guard.dos_sus_threshhold;
     let redis_port = config_guard.redis_server;
     config_guard.servers.drain(1..);
-    at_port.store(Url::parse(config_guard.servers[0].lock().await.ip.as_str()).unwrap().port().unwrap() as u16, Ordering::SeqCst);
 
+    if config_guard.ipc{
+        at_port.store(0u16, Ordering::SeqCst);
+    }else{
+        at_port.store(Url::parse(config_guard.servers[0].lock().await.ip.as_str()).unwrap().port().unwrap() as u16, Ordering::SeqCst);
+    }
 
     let redis_client = redis::Client::open(format!("redis://127.0.0.1:{redis_port}/"), ).unwrap(); 
     let con = Arc::new(Mutex::new(redis_client.get_async_connection().await.unwrap()));
@@ -430,7 +495,13 @@ async fn main() {
     ];
     let port_mk = config_guard.host.1 as u16;
     let addr = (ip_mk, port_mk).into();
-    let client = Arc::new(Client::new());
+    let mut client;
+
+    if config_guard.ipc{
+        client = client_type::Ipc(Arc::new(Client::unix()));
+    }else{
+        client = client_type::Http(Arc::new(Client::new()));
+    }
 
     drop(config_guard);
 
@@ -498,30 +569,55 @@ async fn main() {
             }
 
             if cg.dynamic {
-                if max_res_n.load(Ordering::SeqCst) as f64 > max_res_o.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_o.load(Ordering::SeqCst) != 1{
-                    'outer: loop{
-                        if at_port.load(Ordering::SeqCst) >= cg.max_port {
-                            break 'outer;
+                if !cg.ipc{
+                    if max_res_n.load(Ordering::SeqCst) as f64 > max_res_o.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_o.load(Ordering::SeqCst) != 1{
+                        'outer: loop{
+                            if at_port.load(Ordering::SeqCst) >= cg.max_port {
+                                break 'outer;
+                            }
+                            at_port.fetch_add(1, Ordering::SeqCst);
+                            if spawn_server(cg.bin_path.as_str()){
+                                let mut NewS = cg.servers.last().unwrap().clone();
+                                let mut newS = NewS.lock().await;
+                                cg.servers.push(Arc::new(Mutex::new(Server{ip: increment_port(newS.ip.as_str()), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0})));
+                                break 'outer;
+                            }
                         }
-                        at_port.fetch_add(1, Ordering::SeqCst);
-                        if spawn_server(cg.bin_path.as_str()){
-                            let mut NewS = cg.servers.last().unwrap().clone();
-                            let mut newS = NewS.lock().await;
-                            cg.servers.push(Arc::new(Mutex::new(Server{ip: increment_port(newS.ip.as_str()), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0})));
-                            break 'outer;
+                    }
+
+                    if max_res_o.load(Ordering::SeqCst) as f64 > max_res_n.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_n.load(Ordering::SeqCst) != 1{ 
+                        if cg.servers.len() > 1{
+                            if kill_server().is_ok() {
+                                cg.servers.last().unwrap().lock().await;
+                                cg.servers.pop();
+                            }
+                        }
+                    }
+                }else{
+                    if max_res_n.load(Ordering::SeqCst) as f64 > max_res_o.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_o.load(Ordering::SeqCst) != 1{
+                        'outer: loop{
+                            if at_port.load(Ordering::SeqCst) >= cg.max_port {
+                                break 'outer;
+                            }
+                            at_port.fetch_add(1, Ordering::SeqCst);
+                            if spawn_socket(cg.bin_path.as_str(), cg.ipc_path.as_str()){
+                                let mut NewS = cg.servers.last().unwrap().clone();
+                                let mut newS = NewS.lock().await;
+                                cg.servers.push(Arc::new(Mutex::new(Server{ip: format!("{}", at_port.load(Ordering::SeqCst)), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0})));
+                                break 'outer;
+                            }
+                        }
+                    }
+
+                    if max_res_o.load(Ordering::SeqCst) as f64 > max_res_n.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_n.load(Ordering::SeqCst) != 1{ 
+                        if cg.servers.len() > 1{
+                            if kill_socket(cg.ipc_path.as_str()).is_ok() {
+                                cg.servers.last().unwrap().lock().await;
+                                cg.servers.pop();
+                            }
                         }
                     }
                 }
-
-                if max_res_o.load(Ordering::SeqCst) as f64 > max_res_n.load(Ordering::SeqCst) as f64 * cg.server_spinup_rt_gf && max_res_n.load(Ordering::SeqCst) != 1{ 
-                    if cg.servers.len() > 1{
-                        if kill_server().is_ok() {
-                            cg.servers.last().unwrap().lock().await;
-                            cg.servers.pop();
-                        }
-                    }
-                }
-
             }
             
             max_res_o.store(max_res_n.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -535,9 +631,16 @@ async fn main() {
 
         let (client, timeout_dur, servers, path, health_interval) = {
             let config = CONFIG.lock().await;
+            let client;
+
+            if config.ipc{
+                client = client_type::Ipc(Arc::new(Client::unix()));
+            }else{
+                client = client_type::Http(Arc::new(Client::new()));
+            }
 
             (
-                Arc::new(Client::new()),
+                client,
                 config.timeout_dur,
                 config.servers.clone(),
                 config.health_check_path.clone(),
@@ -611,6 +714,9 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         dtp: f64,
         max_port: u16,
         bin_path: String,
+
+        ipc:bool,
+        ipc_path:String,
     }
 
     let raw_config: RawConfig =
@@ -644,68 +750,10 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         max_port: raw_config.max_port,
         bin_path: raw_config.bin_path,
         
+        ipc: raw_config.ipc,
+        ipc_path: raw_config.ipc_path,
     })
 }
-/*
-async fn updateTARGET() -> anyhow::Result<()> {
-
-    let target_arc = {
-        let guard = TARGET.lock().await; 
-        guard.clone().unwrap()
-    };
-    let mut target = target_arc.lock().await;  
-
-    let mut config = CONFIG.lock().await;
-
-    let mut at_server_idx = atServerIdx.lock().await;
-
-    //next server IDEALLY
-    if at_server_idx[1] >= target.weight{ 
-        at_server_idx[1] = 0;
-        if at_server_idx[0] == config.servers.len() as u64 - 1{ 
-            at_server_idx[0] = 0;
-        }else{
-            at_server_idx[0] += 1;
-        }
-    }else{
-        at_server_idx[1] += 1;
-    }
-
-    drop(target);
-
-    let mut foundHealthy = false;
-    let mut serversChecked = 0;
-
-    while !foundHealthy{
-
-        let server_arc = config.servers[at_server_idx[0] as usize].clone();
-        let server_guard = server_arc.lock().await;
-        let is_active_val = server_guard.is_active.clone();
-
-        if  is_active_val == true{
-            foundHealthy = true;
-            break;
-        }else{
-            if at_server_idx[0] == config.servers.len() as u64 - 1{ 
-                at_server_idx[0] = 0;
-            }else{
-                at_server_idx[0] += 1;
-            }
-        }
-        serversChecked += 1;
-        if serversChecked == config.servers.len() {
-            return Err(anyhow::Error::msg(format_error_type(ErrorTypes::NoHealthyServerFound)))
-        }
-    }
-
-    let target_server = config.servers[at_server_idx[0] as usize].clone();
-    drop(config);
-
-    *TARGET.lock().await = Some(target_server);
-
-    Ok(())
-}
-*/
 
 async fn updateTARGET() -> anyhow::Result<()> {
     let (servers, mut at_idx) = {
@@ -752,7 +800,6 @@ async fn updateTARGET() -> anyhow::Result<()> {
 
     Err(anyhow::anyhow!(format_error_type(ErrorTypes::NoHealthyServerFound)))
 }
-
 
 async fn reorder() -> anyhow::Result<()> {
     let servers_snapshot = {
@@ -975,4 +1022,24 @@ fn increment_port(url_str: &str) -> String {
     url.set_port(Some(port + 1)).unwrap();
     url.to_string()
 }
+
+fn spawn_socket(bin_path: &str, spawn_path: &str) -> bool {
+    let port = at_port.load(Ordering::SeqCst).to_string();
+    let child = Command::new(bin_path)
+        .arg("--socket")
+        .arg(format!("{}{}.sock", &spawn_path, at_port.load(Ordering::SeqCst)))
+        .spawn()
+        .is_ok();
+
+    child
+}
+
+
+fn kill_socket(path: &str) -> anyhow::Result<()> {
+
+    fs::remove_file(format!("{}{}.sock", path, at_port.load(Ordering::SeqCst)));
+    at_port.fetch_sub(1, Ordering::SeqCst);
+    Ok(())
+}
+
 

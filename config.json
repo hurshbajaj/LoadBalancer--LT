@@ -18,7 +18,7 @@
     "Check_in": false,
     "Check_out": true,
 
-    "js_challenge": true,
+    "js_challenge": false,
     "challenge_url": "/js-challenge",
 
     "dynamic": true,
@@ -26,10 +26,13 @@
     "max_port": 6000,
     "bin_path": "./intrasudo25",
 
+    "ipc": true,
+    "ipc_path": "/tmp/test/",
+
     "servers": [
 
         {
-            "ip": "http://localhost:5000",
+            "ip": "/tmp/intrasudo25.sock",
             "is_active": true,
             "strict_timeout": false
         } 
