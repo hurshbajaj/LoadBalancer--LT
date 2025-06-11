@@ -12,7 +12,7 @@
     "dos_sus_threshhold": 12,
 
     "ddos_cap": 150,
-    "ddos_grace_factor": 10,
+    "ddos_grace_factor": 8,
     "dtp": 0.99,
 
     "ban_timeout": 300,

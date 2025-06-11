@@ -209,7 +209,7 @@ async fn proxy(
 
         let config_g = CONFIG.lock().await;
 
-        if req.uri().path() == config_g.challenge_url {
+        if req.uri().path() == config_g.challenge_url && config_g.js_challenge{
             match serve_js_challenge("/").await {
                 Ok(x) => return Ok(x),
                 Err(x) => return Err(anyhow::Error::msg(format_error_type(ErrorTypes::Load_balance_Verification_Fail)))
@@ -226,7 +226,7 @@ async fn proxy(
                 check_o = true;
             }
         }
-        if !has_js_challenge_cookie(&req) {
+        if !has_js_challenge_cookie(&req) && config_g.js_challenge{
             let redirect_url = format!("{}", config_g.challenge_url);
             return Ok(Response::builder()
                 .status(302)
@@ -602,6 +602,10 @@ async fn main() {
             } else {
                 qg.record(total as u32);
             }
+
+            *(CLIclient::blocked_ips.write().await) = {
+                ban_list.read().await.clone()
+            };
 
             if cg.dynamic {
                 if !cg.ipc{
