@@ -6,10 +6,13 @@
     "health_check": 5,
     "health_check_path": "/",
 
-    "dos_sus_threshhold": 10 ,
+    "min_ua_len":0,
+    "blocked_uas": [],
+
+    "dos_sus_threshhold": 12,
 
     "ddos_cap": 150,
-    "ddos_grace_factor": 8,
+    "ddos_grace_factor": 10,
     "dtp": 0.99,
 
     "ban_timeout": 300,
@@ -21,7 +24,7 @@
     "js_challenge": false,
     "challenge_url": "/js-challenge",
 
-    "dynamic": true,
+    "dynamic": false,
     "server_spinup_rt_gf": 2, 
     "max_port": 6000,
     "bin_path": "./intrasudo25",
@@ -30,13 +33,11 @@
     "ipc_path": "/tmp/test/",
 
     "servers": [
-
         {
             "ip": "/tmp/intrasudo25.sock",
             "is_active": true,
             "strict_timeout": false
         } 
-
     ]
 
 }

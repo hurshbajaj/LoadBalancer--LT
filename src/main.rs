@@ -27,7 +27,6 @@ use tokio::sync::RwLock;
 type HmacSha256 = Hmac<Sha256>;
 
 mod CLIclient;
-mod useragents;
 use regex::Regex;
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
@@ -43,7 +42,7 @@ static ban_list: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(vec![]));
 #[derive(Deserialize, Clone)]
 struct IpStruct([u64; 4], u64);
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Deserialize, Clone, Debug, PartialEq)]
 struct Server {
     ip: String,
 
@@ -91,6 +90,9 @@ struct Config {
     max_port: u16,
     ipc_path: String,
     ipc: bool,
+
+    min_ua_len: u64,
+    blocked_uas: Vec<String>
 }
 
 #[derive(Debug)]
@@ -104,6 +106,7 @@ enum ErrorTypes {
     InvalidUserAgent,
     Suspiscious,
     Load_balance_Verification_Fail,
+    BadRequest,
 }
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -170,6 +173,8 @@ async fn proxy(
     dos_threshhold: u64,
 ) -> Result<Response<Body>, anyhow::Error> {
 
+    CLIclient::total.fetch_add(1, Ordering::SeqCst);
+
     dos(origin_ip.clone());
 
    if ban_list.read().await.contains(&origin_ip.clone()){
@@ -193,8 +198,11 @@ async fn proxy(
 
     let methd = req.method();
 
-//   if !useragents::contains(user_agent) {
-   if user_agent.len() < 50 {
+    let (min_ua_len, blocked_uas) = {
+        let g = CONFIG.lock().await;
+        (g.min_ua_len.clone(), g.blocked_uas.clone())
+    };
+   if user_agent.len() < min_ua_len as usize || blocked_uas.contains(&(user_agent.to_string())) {
         return Err(anyhow::Error::msg(format_error_type(ErrorTypes::InvalidUserAgent)));
     }
     {
@@ -326,6 +334,18 @@ async fn proxy(
                         max_res_n.store(start.elapsed().as_millis() as u64, Ordering::SeqCst);
                     }
                     target.res_time = ((start.elapsed().as_millis() as u64) + target.res_time) / 2 as u64;
+                    
+                    if count > 0{
+                        let mut cg = CONFIG.lock().await;
+                        let ci = find_index::<Server>(&cg.servers, &target).await.unwrap();
+                        let cn;
+                        if ci - 1 < 0{
+                            cn = cg.servers.len() - 1;
+                        } else{
+                            cn = ci-1;
+                        }
+                        cg.servers[cn].lock().await.is_active == false;
+                    }
 
                     // cache
                     if let Some(cache_control) = response.headers().get("cache-control") {
@@ -370,7 +390,8 @@ async fn proxy(
                 // this can be intended by the server, don't mark as non-active
                 Err(_) => {
                     if count >= 1 {
-                        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::UpstreamServerFailed)))
+                        CLIclient::total_bad.fetch_add(1, Ordering::SeqCst);
+                        return Err(anyhow::Error::msg(format_error_type(ErrorTypes::BadRequest)))
                     }
                 }
             },
@@ -389,6 +410,19 @@ async fn proxy(
             }
         }
     };
+}
+
+async fn find_index<T>(vec: &[Arc<Mutex<T>>], target: &T) -> Option<usize>
+where
+    T: PartialEq + Send + Sync,
+{
+    for (i, item) in vec.iter().enumerate() {
+        let value = item.lock().await;
+        if &(*value) == target {
+            return Some(i);
+        }
+    }
+    None
 }
 
 async fn health_check_proxy(
@@ -559,6 +593,7 @@ async fn main() {
             }
 
             if qg.is_anomaly(total as u32, cg.ddos_grace_factor, cg.ddos_cap, cg.dtp).await {
+                CLIclient::total_ddos_a.fetch_add(1, Ordering::SeqCst);
                 loop {
                     if !check_and_ban_top_ip(cg.dos_sus_threshhold).await {
                         break;
@@ -619,6 +654,33 @@ async fn main() {
                     }
                 }
             }
+
+            let mut cli_names = CLIclient::server_names.write().await;
+            let mut cli_names_p = vec![];
+            for s in cg.servers.clone(){
+                let to_push = s.lock().await;
+                cli_names_p.push(to_push.ip.clone());
+            }
+            *cli_names = cli_names_p;
+            drop(cli_names);
+
+            let mut cli_rts = CLIclient::server_rts.write().await;
+            let mut cli_rts_p = vec![];
+            for s in cg.servers.clone(){
+                let to_push = s.lock().await;
+                cli_rts_p.push(to_push.res_time.to_string().clone());
+            }
+            *cli_rts = cli_rts_p;
+            drop(cli_rts);
+
+            let mut cli_ias = CLIclient::server_is_actives.write().await;
+            let mut cli_ias_p = vec![];
+            for s in cg.servers.clone(){
+                let to_push = s.lock().await;
+                cli_ias_p.push(to_push.is_active);
+            }
+            *cli_ias = cli_ias_p;
+            drop(cli_ias);
             
             max_res_o.store(max_res_n.load(Ordering::SeqCst), Ordering::SeqCst);
             max_res_n.store(1, Ordering::SeqCst);
@@ -717,6 +779,9 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
 
         ipc:bool,
         ipc_path:String,
+
+        min_ua_len: u64,
+        blocked_uas: Vec<String>,
     }
 
     let raw_config: RawConfig =
@@ -752,6 +817,9 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
         
         ipc: raw_config.ipc,
         ipc_path: raw_config.ipc_path,
+
+        min_ua_len: raw_config.min_ua_len,
+        blocked_uas: raw_config.blocked_uas,
     })
 }
 

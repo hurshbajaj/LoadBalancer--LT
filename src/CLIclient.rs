@@ -1,15 +1,23 @@
-use std::{sync::Arc, time::{Duration, Instant}};
+use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, time::{Duration, Instant}};
 
 use chrono::{Local, NaiveDateTime, TimeZone};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use once_cell::sync::Lazy;
 use ratatui::{
-    layout::{Constraint, Layout}, style::{Style, Stylize}, symbols, text::Line, widgets::{Axis, Block, Chart, Dataset, Paragraph}, DefaultTerminal, Frame
+    layout::{Constraint, Layout}, style::{Style, Stylize}, symbols, text::Line, widgets::{Axis, Block, Borders, Chart, Dataset, List, ListItem, Paragraph}, DefaultTerminal, Frame
 };
 use tokio::sync::RwLock;
 
 pub static reqs: Lazy<Arc<RwLock<u64>>> = Lazy::new(|| Arc::new(RwLock::new(0u64)));
+
+pub static server_names: Lazy<Arc<RwLock<Vec<String>>>> = Lazy::new(|| Arc::new(RwLock::new(vec![])));
+pub static server_rts: Lazy<Arc<RwLock<Vec<String>>>> = Lazy::new(|| Arc::new(RwLock::new(vec![])));
+pub static server_is_actives: Lazy<Arc<RwLock<Vec<bool>>>> = Lazy::new(|| Arc::new(RwLock::new(vec![])));
+
+pub static total: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0u64)));
+pub static total_bad: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0u64)));
+pub static total_ddos_a: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0u64)));
 
 pub async fn establish() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -23,6 +31,15 @@ pub async fn establish() -> color_eyre::Result<()> {
 pub struct App {
     running: bool,
     req_chart_vals: Vec<(f64, f64)>,
+
+    selected: usize,
+    server_names: Vec<String>,
+    server_rts: Vec<String>,
+    server_is_actives: Vec<bool>,
+
+    total: AtomicU64,
+    total_bad: AtomicU64,
+    total_ddos_a: AtomicU64,
 }
 
 impl App {
@@ -30,6 +47,15 @@ impl App {
         Self {
             running: true,
             req_chart_vals: vec![],
+
+            selected: 0,
+            server_names: vec![],
+            server_rts: vec![],
+            server_is_actives: vec![],
+
+            total: AtomicU64::new(0u64),
+            total_bad: AtomicU64::new(0u64),
+            total_ddos_a: AtomicU64::new(0u64),
         }
     }
 
@@ -56,14 +82,31 @@ impl App {
                 let mut Reqs = reqs.write().await;
                 *Reqs = 0u64;
 
+                //-----------------------------------------------------------------
+                
+                self.server_names = (server_names.read().await).clone();
+                self.server_rts = (server_rts.read().await).clone();
+                self.server_is_actives = (server_is_actives.read().await).clone();
+
                 timer -= 1.0;
+
+                //-----------------------------------------------------------------
+
+                self.total.store(total.load(Ordering::SeqCst), Ordering::SeqCst);
+                self.total_bad.store(total_bad.load(Ordering::SeqCst), Ordering::SeqCst);
+                self.total_ddos_a.store(total_ddos_a.load(Ordering::SeqCst), Ordering::SeqCst);
             }
         }
         Ok(())
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        let [graph_sect] = Layout::vertical([Constraint::Fill(1)]).areas(frame.area());
+        let [graph_sect, metric_sect] = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).areas(frame.area());
+        let [server_sect, other_sect] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(metric_sect);
+
+
+        let [server_name_sect, server_avg_rt_sect, server_active_sect] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)]).areas(server_sect);
+        let [Total_req_sect, bad_req_sect, ddos_attempt_sect] = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)]).areas(other_sect);
 
         let x_min = self.req_chart_vals.first().map(|(x, _)| *x).unwrap_or(0.0);
         let x_max = self.req_chart_vals.last().map(|(x, _)| *x).unwrap_or(1.0);
@@ -102,6 +145,54 @@ impl App {
             );
 
         frame.render_widget(chart, graph_sect);
+
+        let height = server_sect.height as usize - 2; // account for borders
+        let start:&usize = &self.selected.saturating_sub(height.saturating_sub(1));
+        let end: &usize = &((start + height).min((&self).server_names.len().clone()));
+        let visible_names: Vec<_> = (&self).server_names[*start..*end]
+            .iter()
+            .map(|i| ListItem::new(i.clone()))
+            .collect();
+
+        let list = List::new(visible_names)
+            .block(Block::default().borders(Borders::ALL).title("Servers"));
+
+        frame.render_widget(list, server_name_sect);
+
+        let visible_server_rts: Vec<_> = (&self).server_rts[*start..*end]
+            .iter()
+            .map(|i| ListItem::new(i.clone()))
+            .collect();
+
+        let list = List::new(visible_server_rts)
+            .block(Block::default().borders(Borders::ALL).title("Avg Res Time"));
+
+        frame.render_widget(list, server_avg_rt_sect);
+
+        let visible_server_ias: Vec<_> = (&self).server_is_actives[*start..*end]
+            .iter()
+            .map(|i| ListItem::new(i.to_string().clone()))
+            .collect();
+
+        let list = List::new(visible_server_ias)
+            .block(Block::default().borders(Borders::ALL).title("Active"));
+
+        frame.render_widget(list, server_active_sect);
+
+        let total_l = Paragraph::new(Line::from((&self).total.load(Ordering::SeqCst).to_string()))
+            .block(Block::default().title("Total Reqs").borders(Borders::ALL));
+
+        frame.render_widget(total_l, Total_req_sect);
+
+        let total_bad_l = Paragraph::new(Line::from(format!("{} (%)", (( (&self).total_bad.load(Ordering::SeqCst) / (&self).total.load(Ordering::SeqCst).max(1) * 100)).to_string())))
+            .block(Block::default().title("% of Bad Requests").borders(Borders::ALL));
+
+        frame.render_widget(total_bad_l, bad_req_sect);
+
+        let total_ddos_al = Paragraph::new(Line::from(format!("{}", (&self).total_ddos_a.load(Ordering::SeqCst).to_string())))
+            .block(Block::default().title("DDoS Attempts").borders(Borders::ALL));
+
+        frame.render_widget(total_ddos_al, ddos_attempt_sect);
     }
 
     fn handle_crossterm_events(&mut self) -> Result<()> {
@@ -116,16 +207,27 @@ impl App {
         Ok(())
     }
 
-    fn on_key_event(&mut self, key: KeyEvent) {
-        match (key.modifiers, key.code) {
-            (_, KeyCode::Esc | KeyCode::Char('q'))
-            | (KeyModifiers::CONTROL, KeyCode::Char('c') | KeyCode::Char('C')) => { self.quit() },
-            _ => {}
-        }
+    pub fn quit(&mut self) {
+        self.running = false;
     }
 
-    fn quit(&mut self) {
-        self.running = false;
+    fn on_key_event(&mut self, key: KeyEvent) {
+        match (key.modifiers, key.code) {
+                (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
+                    self.quit();
+                },
+                (_, KeyCode::Down) => {
+                    if self.selected < self.server_names.len() - 1 {
+                        self.selected += 1;
+                    }
+                },
+                (_, KeyCode::Up) => {
+                    if self.selected > 0 {
+                        self.selected -= 1;
+                    }
+                },
+                _ => {}
+        }
     }
 }
 
