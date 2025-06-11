@@ -20,4 +20,5 @@ Written in Rust, uses < Weighted Round Robin > to evenly distribute requests.
 - Redis Cache
 - Method Hash Verification (HMAC) | JS challenge
 - IPC support
+- Metrics
 <hr>
