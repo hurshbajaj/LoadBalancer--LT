@@ -1,9 +1,10 @@
 use dashmap::DashMap;
+use flate2::{write::{GzDecoder, GzEncoder}, Compression};
 use ratatui::crossterm::event::{self, Event, KeyCode};
 use sha2::{digest::typenum::Max, Digest, Sha256};
 use redis::AsyncCommands;
 use url::Url;
-use std::{f64::MANTISSA_DIGITS, fs::{self, File}, io::Read, iter::from_fn, os::raw, process::Command, str::FromStr, sync::{atomic::{AtomicU16, AtomicU64}, Arc}, thread::{self, current}, time::{Duration, Instant}};
+use std::{f64::MANTISSA_DIGITS, fs::{self, File}, io::{Cursor, Read, Write}, iter::from_fn, net::{Ipv4Addr, SocketAddrV4, TcpListener}, os::raw, process::Command, str::FromStr, sync::{atomic::{AtomicU16, AtomicU64}, Arc}, thread::{self, current}, time::{Duration, Instant}};
 use tokio::{sync::{Mutex, MutexGuard}, time::{self, timeout}};
 use hyper::{
     body::to_bytes, client::HttpConnector, header::{HeaderName, HeaderValue}, service::{make_service_fn, service_fn}, Body, Client, Request, Response, Server as HyperServer, Uri
@@ -27,11 +28,12 @@ use tokio::sync::RwLock;
 type HmacSha256 = Hmac<Sha256>;
 
 mod CLIclient;
-use CLIclient::log;
+use CLIclient::{log};
 use regex::Regex;
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
-static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(load_from_file("./config.json").unwrap()));
+static CONFIG_pre: Lazy<Mutex<Result<Config, anyhow::Error>>> = Lazy::new(|| Mutex::new(load_from_file("./config.json")));
+static CONFIG: Lazy<Mutex<Config>> = Lazy::new(|| Mutex::new(Config::default()));
 static max_res: Lazy<Mutex<u64>> =  Lazy::new(|| Mutex::new(1u64));
 
 static max_res_o:  Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
@@ -40,12 +42,15 @@ static max_res_n:  Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
 static atServerIdx: Lazy<Mutex<[u64; 2]>> = Lazy::new(|| Mutex::new([0u64, 0u64]));
 
 static ban_list: Lazy<RwLock<Vec<String>>> = Lazy::new(|| RwLock::new(vec![])); 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Default)]
 struct IpStruct([u64; 4], u64);
 
-#[derive(Deserialize, Clone, Debug, PartialEq)]
+#[derive(Deserialize, Debug)]
 struct Server {
     ip: String,
+
+    #[serde(skip)]
+    concurrent: AtomicU64,
 
     #[serde(skip)]
     weight: u64,
@@ -60,7 +65,46 @@ struct Server {
     timeout_tick: u16,
 }
 
-#[derive(Deserialize, Clone)]
+impl PartialEq for Server {
+    fn eq(&self, other: &Self) -> bool {
+        self.ip == other.ip
+    }
+}
+
+impl Clone for Server {
+    fn clone(&self) -> Self {
+        Self {
+            ip: self.ip.clone(),
+            concurrent: AtomicU64::new(self.concurrent.load(Ordering::Relaxed)),
+            weight: self.weight,
+            is_active: self.is_active,
+            res_time: self.res_time,
+            strict_timeout: self.strict_timeout,
+            timeout_tick: self.timeout_tick,
+        }
+    }
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self {
+            ip: String::default(),
+
+            concurrent: AtomicU64::new(0),
+
+            weight: 0,
+            is_active: false,
+
+            res_time: 0,
+
+            strict_timeout: false,
+
+            timeout_tick: 0,
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Default)]
 struct Config {
     host: IpStruct,
     redis_server: u64,
@@ -93,7 +137,11 @@ struct Config {
     ipc: bool,
 
     min_ua_len: u64,
-    blocked_uas: Vec<String>
+    blocked_uas: Vec<String>,
+    max_concurrent_reqs_ps: u64,
+    compression: bool,
+    max_cache_mem: String,
+    cache_eviction_policy: String,
 }
 
 #[derive(Debug)]
@@ -129,7 +177,6 @@ fn dos(ip: String){
     entry.fetch_add(1, Ordering::SeqCst);
 
 }
-
 
 struct SlidingQuantile {
     window: VecDeque<u32>,
@@ -246,21 +293,25 @@ async fn proxy(
     let mut cache_req: Request<Body>;
     (cache_req, req) = clone_request(req).await.unwrap();
 
-    let cache_key = build_cache_key(&mut cache_req).await.unwrap();
-
+    let cache_key = build_cache_key(cache_req).await.unwrap();
+    
     {
         let mut redis = redis_conn.lock().await;
-        match redis.get::<_, String>(&cache_key).await {
-            Ok(cached_value) => {
-                // Found in cache, return as response
-                return Ok(Response::new(Body::from(cached_value)))
+        match redis.get::<_, Vec<u8>>(&cache_key).await {
+            Ok(mut cached_value) => {
+                if CONFIG.lock().await.compression{
+                    let decompressed = decompress_bytes(&mut cached_value)?;
+                    return Ok(Response::new(Body::from(decompressed)))
+                }else{
+                    return Ok(Response::new(Body::from(cached_value)))
+                }
             }
             _ => {}
         }
     }
+    
 
     loop {
-        count += 1;
         let req_clone: Request<Body>;
         (req_clone, req) = clone_request(req).await.unwrap();
 
@@ -318,10 +369,20 @@ async fn proxy(
 
         let mut timeout_result;
 
+        let max_concurrent = {
+            let g = CONFIG.lock().await;
+            g.max_concurrent_reqs_ps
+        };
+        if target.concurrent.load(Ordering::SeqCst) >= max_concurrent{continue;}
+        target.concurrent.fetch_add(1, Ordering::SeqCst);
+        count += 1;
+
         match client{
             client_type::Http(ref x) => {timeout_result = timeout(Duration::from_secs(timeout_dur), x.request(proxied_req)).await;},
             client_type::Ipc(ref x) => {timeout_result = timeout(Duration::from_secs(timeout_dur), x.request(proxied_req)).await;},
         }
+
+        target.concurrent.fetch_sub(1, Ordering::SeqCst);
 
         match timeout_result {
             Ok(result) => match result {
@@ -355,18 +416,24 @@ async fn proxy(
                                 if max_age_secs > 0 {
                                     let status = response.status();
                                     let version = response.version();
-                                    let headers = response.headers().clone(); // clone headers
+                                    let headers = response.headers().clone();
 
                                     let body_bytes = hyper::body::to_bytes(response.into_body()).await?;
-                                    let body_clone_for_cache = body_bytes.clone(); 
-                                    let body_clone_for_response = body_bytes.clone();
+                                    let body_string = String::from_utf8(body_bytes.to_vec())?;
 
-                                    let body_string = String::from_utf8(body_clone_for_cache.to_vec()).unwrap();
+                                    let compressed = compress_str(&body_string)?;
 
                                     let mut redis = redis_conn.lock().await;
-                                    redis.set_ex::<_, _, ()>(&cache_key, body_string, max_age_secs as u64).await?;
 
-                                    // rebuild response
+                                    let compression_enable = {
+                                        CONFIG.lock().await.compression  
+                                    };
+                                    if compression_enable{
+                                       redis.set_ex::<_, _, ()>(&cache_key, compressed, max_age_secs as u64).await.unwrap_or_else(|_|{});
+                                    }else{
+                                       redis.set_ex::<_, _, ()>(&cache_key, body_string.clone(), max_age_secs as u64).await.unwrap_or_else(|_|{});
+                                    }
+
                                     let mut new_response = Response::builder()
                                         .status(status)
                                         .version(version);
@@ -376,11 +443,10 @@ async fn proxy(
                                     }
 
                                     let rebuilt = new_response
-                                        .body(Body::from(body_clone_for_response))
+                                        .body(Body::from(body_string))
                                         .unwrap();
 
                                     return Ok(rebuilt);
-
                                 }
                             }
                         }
@@ -498,9 +564,19 @@ enum client_type{
     Ipc(Arc<Client<UnixConnector, Body>>)
 }
 
+use console_subscriber;
+
 #[tokio::main]
 async fn main() {
+    console_subscriber::init();
+    let clientRun = tokio::spawn(async {
+        CLIclient::establish().await;
+    });
     log("Starting Loadbalancer...");
+
+    if !check_startup().await.is_ok() {
+        loop{}
+    }
 
     {
         let config = CONFIG.lock().await;
@@ -520,8 +596,31 @@ async fn main() {
         at_port.store(Url::parse(config_guard.servers[0].lock().await.ip.as_str()).unwrap().port().unwrap() as u16, Ordering::SeqCst);
     }
 
-    let redis_client = redis::Client::open(format!("redis://127.0.0.1:{redis_port}/"), ).unwrap(); 
+    let redis_client = redis::Client::open(format!("redis://127.0.0.1:{redis_port}/")).unwrap();
     let con = Arc::new(Mutex::new(redis_client.get_async_connection().await.unwrap()));
+
+    use redis::AsyncCommands;
+
+    {
+        let mut conn_guard = con.lock().await;
+
+        let _: () = redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("maxmemory")
+            .arg(config_guard.max_cache_mem.clone().as_str())
+            .query_async(&mut *conn_guard).await.unwrap_or_else(|_| {
+                elog("Cache Max Memory: Invalid ; Restart Required...");
+                loop {}
+            });
+
+        let _: () = redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("maxmemory-policy")
+            .arg(config_guard.cache_eviction_policy.as_str())
+            .query_async(&mut *conn_guard).await.unwrap_or_else(|_| {
+                elog("Cache Eviction Policy: Invalid ; WARNING!");
+            });
+    }
 
     let ip_mk = [
         config_guard.host.0[0] as u8,
@@ -622,7 +721,7 @@ async fn main() {
                             if spawn_server(cg.bin_path.as_str()){
                                 let mut NewS = cg.servers.last().unwrap().clone();
                                 let mut newS = NewS.lock().await;
-                                cg.servers.push(Arc::new(Mutex::new(Server{ip: increment_port(newS.ip.as_str()), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0})));
+                                cg.servers.push(Arc::new(Mutex::new(Server{ip: increment_port(newS.ip.as_str()), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0, concurrent: AtomicU64::new(0)})));
                                 break 'outer;
                             }
                         }
@@ -646,7 +745,7 @@ async fn main() {
                             if spawn_socket(cg.bin_path.as_str(), cg.ipc_path.as_str()){
                                 let mut NewS = cg.servers.last().unwrap().clone();
                                 let mut newS = NewS.lock().await;
-                                cg.servers.push(Arc::new(Mutex::new(Server{ip: format!("{}", at_port.load(Ordering::SeqCst)), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0})));
+                                cg.servers.push(Arc::new(Mutex::new(Server{ip: format!("{}", at_port.load(Ordering::SeqCst)), weight: 1, is_active: true, res_time: 0, strict_timeout: newS.strict_timeout, timeout_tick: 0, concurrent: AtomicU64::new(0)})));
                                 break 'outer;
                             }
                         }
@@ -745,10 +844,6 @@ async fn main() {
         }
     });
 
-    let clientRun = tokio::spawn(async {
-        CLIclient::establish().await;
-    });
-
     log("Load Balancer Running...");
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
@@ -793,12 +888,18 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
 
         min_ua_len: u64,
         blocked_uas: Vec<String>,
+
+        max_concurrent_reqs_ps: u64,
+
+        compression: bool,
+        max_cache_mem: String,
+        cache_eviction_policy: String,
     }
 
     let raw_config: RawConfig =
         serde_json::from_str(&json_data).context("Failed to deserialize JSON from file")?;
 
-    log("Loaded from config...");
+    log("Loading from config...");
 
     let servers = raw_config
         .servers
@@ -833,9 +934,14 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
 
         min_ua_len: raw_config.min_ua_len,
         blocked_uas: raw_config.blocked_uas,
+
+        max_concurrent_reqs_ps: raw_config.max_concurrent_reqs_ps,
+        compression: raw_config.compression,
+        max_cache_mem: raw_config.max_cache_mem,
+        cache_eviction_policy: raw_config.cache_eviction_policy,
+
     })
 }
-
 async fn updateTARGET() -> anyhow::Result<()> {
     let (servers, mut at_idx) = {
         let config = CONFIG.lock().await;
@@ -866,7 +972,7 @@ async fn updateTARGET() -> anyhow::Result<()> {
             if server_guard.is_active {
                 found_healthy = true;
             }
-        } // <- ✅ drop `server_guard` here
+        } 
 
         if found_healthy {
             *TARGET.lock().await = Some(server);
@@ -943,44 +1049,6 @@ async fn clone_request(req: Request<Body>) -> Result<(Request<Body>, Request<Bod
 
     Ok((req1, req2))
 } 
-
-pub async fn build_cache_key(req: &mut Request<Body>) -> Result<String, anyhow::Error> {
-    dotenv().ok();
-
-    let method = req.method().as_str();
-    let uri = req.uri().to_string();
-    let method = req.method().clone();
-
-    let whole_body = to_bytes(req.body_mut()).await?;
-    let mut hasher = Sha256::new();
-    hasher.update(env::var("secret").unwrap_or(String::new()));
-    hasher.update(&whole_body);
-    let body_hash = hasher.finalize();
-    let body_digest = hex::encode(body_hash);
-
-    *req.body_mut() = Body::from(whole_body);
-
-    Ok(format!("CACHE:{}:{}:{}", method, uri, body_digest))
-}
-
-pub fn verify_hmac_from_env(message: &str, provided_hash: &str) -> bool {
-    dotenv().ok();
-    let secret = match env::var("secret") {
-        Ok(val) => val,
-        Err(_) => return false,
-    };
-
-    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
-        Ok(mac) => mac,
-        Err(_) => return false,
-    };
-    mac.update(message.as_bytes());
-    let result = mac.finalize();
-    let code_bytes = result.into_bytes();
-    let calculated_hash = general_purpose::STANDARD.encode(code_bytes);
-
-    calculated_hash == provided_hash
-}
 
 pub fn methd_hash_from_env(message: &str) -> String {
     dotenv().ok();
@@ -1115,10 +1183,117 @@ fn spawn_socket(bin_path: &str, spawn_path: &str) -> bool {
     child
 }
 
-
 fn kill_socket(path: &str) -> anyhow::Result<()> {
 
     fs::remove_file(format!("{}{}.sock", path, at_port.load(Ordering::SeqCst)));
     at_port.fetch_sub(1, Ordering::SeqCst);
     Ok(())
+}
+
+static error_token: &'static str = "\x1b[31m[ERROR]\x1b[0m";
+
+fn elog(value: &str) {
+    log(error_token);
+    log(format!("{value}").as_str());
+}
+
+fn glog(value: &str) {
+    log(format!("\x1b[92m{value}\x1b[0m").as_str());
+}
+
+async fn check_startup() -> anyhow::Result<()> {
+    let cg_p_guard = CONFIG_pre.lock().await;
+    let mut port;
+
+    if let Ok(config) = &*cg_p_guard {
+        let mut cg = CONFIG.lock().await;
+        *cg = config.clone(); // clone the inner Config
+        port = Some(cg.host.clone());
+    } else {
+        elog("Failed to load from Config... Restart Needed");
+        return Err(anyhow::anyhow!("Failed to load config"))
+    }
+
+    let arg = [port.clone().unwrap().0[0] as u8, port.clone().unwrap().0[1] as u8, port.clone().unwrap().0[2] as u8, port.clone().unwrap().0[3] as u8];
+
+    if !check_port(arg, port.clone().unwrap().1 as u16){
+        elog("Host Port occupied... Restart Needed");
+        return Err(anyhow::anyhow!("Port Occupied"))
+    }
+
+    glog("[Startup-Ready]");
+    Ok(())
+}
+
+fn check_port(addr: [u8; 4], port: u16) -> bool {
+    let ip = Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
+    let socket = SocketAddrV4::new(ip, port);
+
+    match TcpListener::bind(socket) {
+        Ok(listener) => {
+            drop(listener); 
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn compress_str(data: &str) -> Result<Vec<u8>, anyhow::Error> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data.as_bytes())?;
+    Ok(encoder.finish()?)
+}
+
+fn decompress_bytes(data: &mut [u8]) -> Result<String, anyhow::Error> {
+    let cursor = Cursor::new(data);
+    let mut decoder = GzDecoder::new(cursor);
+    let mut decoded = String::new();
+    decoder.read_to_string(&mut decoded)?;
+    Ok(decoded)
+}
+
+pub async fn build_cache_key(mut req: Request<Body>) -> Result<Vec<u8>, anyhow::Error> {
+    dotenv::dotenv().ok();
+
+    let method = req.method().clone();
+    let uri = req.uri().to_string();
+
+    let whole_body = to_bytes(req.body_mut()).await?;
+    *req.body_mut() = Body::from(whole_body.clone());
+
+    let composite = format!(
+        "CACHE:{}:{}:{}",
+        method,
+        uri,
+        String::from_utf8_lossy(&whole_body)
+    );
+
+    let compress = {
+        CONFIG.lock().await.compression
+    };
+
+    if !compress{
+        return Ok(composite.into_bytes())
+    }
+
+    compress_str(&composite)
+}
+
+pub fn verify_hmac_from_env(message: &str, provided_hash: &str) -> bool {
+    dotenv().ok();
+    let secret = match env::var("secret") {
+        Ok(val) => val,
+        Err(_) => return false,
+    };
+
+    let mut mac = match HmacSha256::new_from_slice(secret.as_bytes()) {
+        Ok(mac) => mac,
+        Err(_) => return false,
+    };
+    mac.update(message.as_bytes());
+    let result = mac.finalize();
+    let code_bytes = result.into_bytes();
+    let calculated_hash = general_purpose::STANDARD.encode(code_bytes);
+
+    calculated_hash == provided_hash
 }

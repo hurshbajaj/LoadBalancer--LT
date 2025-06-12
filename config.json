@@ -1,7 +1,10 @@
 {
     "host": [[127, 0, 0, 1], 3000],
+
     "redis_server": 3001,
-    "timeout_dur": 10,
+    "compression": true,
+    "max_cache_mem": "100mb",
+    "cache_eviction_policy": "allkeys-lru",
 
     "health_check": 5,
     "health_check_path": "/",
@@ -31,6 +34,9 @@
 
     "ipc": true,
     "ipc_path": "/tmp/test/",
+
+    "max_concurrent_reqs_ps": 160,
+    "timeout_dur": 10,
 
     "servers": [
         {

@@ -1,4 +1,4 @@
-use std::{sync::{atomic::{AtomicU64, Ordering}, Arc}, time::{Duration, Instant}};
+use std::{fmt::format, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::{Duration, Instant}};
 
 use chrono::{Local, NaiveDateTime, TimeZone};
 use color_eyre::Result;
@@ -385,6 +385,4 @@ fn generate_y_labels(min: f64, max: f64, count: usize) -> Vec<String> {
         .map(|i| format!("{:.0}", ( min + step * i as f64) as u64)) // ← Round to nearest int
         .collect()
 }
-
-
 
