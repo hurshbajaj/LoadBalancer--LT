@@ -8,6 +8,7 @@ use ratatui::{
     layout::{Constraint, Layout}, style::{Style, Stylize}, symbols, text::Line, widgets::{Axis, Block, Borders, Chart, Dataset, List, ListItem, Paragraph}, DefaultTerminal, Frame
 };
 use tokio::sync::RwLock;
+use std::sync::RwLock as RwLock_std;
 
 pub static reqs: Lazy<Arc<RwLock<u64>>> = Lazy::new(|| Arc::new(RwLock::new(0u64)));
 
@@ -23,6 +24,24 @@ pub static blocked_ips: Lazy<Arc<RwLock<Vec<String>>>> = Lazy::new(|| Arc::new(R
 static rps_ema: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0u64)));
 static rps: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0u64)));
 static rpsc: Lazy<Arc<RwLock<Vec<u64>>>> = Lazy::new(|| Arc::new(RwLock::new(vec![])));
+
+static logs: Lazy<Arc<RwLock_std<Vec<String>>>> = Lazy::new(|| Arc::new(RwLock_std::new(vec![])));
+
+pub fn log(value: &str) {
+    loop {
+        if let Ok(mut guard) = logs.try_write() {
+            guard.push(format!(
+                "| {:?} {}",
+                ms_since_epoch_to_hms(chrono::Local::now().timestamp_millis() as i64),
+                value
+            ));
+            break;
+        }
+    }
+}
+
+static rt_avg: Lazy<Arc<AtomicU64>> = Lazy::new(|| Arc::new(AtomicU64::new(0u64)));
+pub static rt_avg_c: Lazy<Arc<RwLock<Vec<u64>>>> = Lazy::new(|| Arc::new(RwLock::new(vec![])));
 
 pub async fn establish() -> color_eyre::Result<()> {
     color_eyre::install()?;
@@ -48,6 +67,7 @@ pub struct App {
     total_ddos_a: AtomicU64,
 
     blocked_ips: Vec<String>,
+    logs: Vec<String>,
 }
 
 impl App {
@@ -61,6 +81,8 @@ impl App {
             server_names: vec![],
             server_rts: vec![],
             server_is_actives: vec![],
+
+            logs: vec![],
 
             total: AtomicU64::new(0u64),
             total_bad: AtomicU64::new(0u64),
@@ -77,9 +99,12 @@ impl App {
         while self.running {
             let start = Instant::now();
             terminal.draw(|frame| self.render(frame))?;
-            self.handle_crossterm_events()?;
+            self.handle_crossterm_events().await?;
 
             timer += start.elapsed().as_secs_f64();
+
+            self.logs = (logs.try_read()).unwrap().clone();
+
             if timer >= 1.0 {
                 let now = chrono::Local::now().timestamp_millis() as f64;
                 self.req_chart_vals.push((now, *(reqs.clone().read().await) as f64));
@@ -123,6 +148,12 @@ impl App {
                 self.blocked_ips = (blocked_ips.read().await).clone();
 
                 rps.store((Rpsc.iter().sum::<u64>() / Rpsc.len() as u64)as u64, Ordering::SeqCst);
+
+                //-----------------------------------------------------------------
+
+                let rts = (rt_avg_c.read().await).clone().iter().cloned().collect::<Vec<u64>>();
+                
+                rt_avg.store(rts.iter().sum::<u64>() / rts.len().max(1) as u64, Ordering::SeqCst);
 
             }
         }
@@ -171,55 +202,45 @@ impl App {
 
         frame.render_widget(chart, graph_sect);
 
-        let height = server_sect.height as usize - 2; // account for borders
-        let start:&usize = &self.selected.saturating_sub(height.saturating_sub(1));
-        let end: &usize = &((start + height).min((&self).server_names.len().clone()));
-        let visible_names: Vec<_> = (&self).server_names[*start..*end]
-            .iter()
-            .map(|i| ListItem::new(i.clone()))
-            .collect();
-
-        let list = List::new(visible_names)
-            .block(Block::default().borders(Borders::ALL).title("Servers"));
-
-        let visible_server_rts: Vec<_> = (&self).server_rts[*start..*end]
-            .iter()
-            .map(|i| ListItem::new(i.clone()))
-            .collect();
-
-        let list_rts = List::new(visible_server_rts)
-            .block(Block::default().borders(Borders::ALL).title("Avg Res Time"));
-
-        let visible_server_ias: Vec<_> = (&self).server_is_actives[*start..*end]
-            .iter()
-            .map(|i| ListItem::new(i.to_string().clone()))
-            .collect();
-
-        let list_as = List::new(visible_server_ias)
-            .block(Block::default().borders(Borders::ALL).title("Active"));
-
-        let total_l = Paragraph::new(Line::from((&self).total.load(Ordering::SeqCst).to_string()))
-            .block(Block::default().title("Total Reqs").borders(Borders::ALL));
-
-        let total_bad_l = Paragraph::new(Line::from(format!("{} (%)", (( (&self).total_bad.load(Ordering::SeqCst) / (&self).total.load(Ordering::SeqCst).max(1) * 100)).to_string())))
-            .block(Block::default().title("% of Bad Requests").borders(Borders::ALL));
-
-
-        let total_ddos_al = Paragraph::new(Line::from(format!("{}", (&self).total_ddos_a.load(Ordering::SeqCst).to_string())))
-            .block(Block::default().title("DDoS Attempts").borders(Borders::ALL));
-
-        let height_bl = server_sect.height as usize - 2; // account for borders
-        let start_bl:&usize = &self.selected.saturating_sub(height.saturating_sub(1));
-        let end_bl: &usize = &((start + height).min((&self).blocked_ips.len().clone()));
-        let visible_bl_items: Vec<_> = (&self).blocked_ips[*start_bl..*end_bl]
-            .iter()
-            .map(|i| ListItem::new(i.clone()))
-            .collect();
-
-        let list_bl = List::new(visible_bl_items)
-            .block(Block::default().borders(Borders::ALL).title("Banned IP's"));
-
         if (&self).screen.clone() == 0u64{
+
+            let height = server_sect.height as usize - 2; // account for borders
+            let start:&usize = &self.selected.saturating_sub(height.saturating_sub(1));
+            let end: &usize = &((start + height).min((&self).server_names.len().clone()));
+            let visible_names: Vec<_> = (&self).server_names[*start..*end]
+                .iter()
+                .map(|i| ListItem::new(i.clone()))
+                .collect();
+
+            let list = List::new(visible_names)
+                .block(Block::default().borders(Borders::ALL).title("Servers"));
+
+            let visible_server_rts: Vec<_> = (&self).server_rts[*start..*end]
+                .iter()
+                .map(|i| ListItem::new(i.clone()))
+                .collect();
+
+            let list_rts = List::new(visible_server_rts)
+                .block(Block::default().borders(Borders::ALL).title("Res Time Avg [EMA]"));
+
+            let visible_server_ias: Vec<_> = (&self).server_is_actives[*start..*end]
+                .iter()
+                .map(|i| ListItem::new(i.to_string().clone()))
+                .collect();
+
+            let list_as = List::new(visible_server_ias)
+                .block(Block::default().borders(Borders::ALL).title("Active"));
+
+            let total_l = Paragraph::new(Line::from((&self).total.load(Ordering::SeqCst).to_string()))
+                .block(Block::default().title("Total Reqs").borders(Borders::ALL));
+
+            let total_bad_l = Paragraph::new(Line::from(format!("{} (%)", (( (&self).total_bad.load(Ordering::SeqCst) / (&self).total.load(Ordering::SeqCst).max(1) * 100)).to_string())))
+                .block(Block::default().title("% of Bad Requests").borders(Borders::ALL));
+
+
+            let total_ddos_al = Paragraph::new(Line::from(format!("{}", (&self).total_ddos_a.load(Ordering::SeqCst).to_string())))
+                .block(Block::default().title("DDoS Attempts").borders(Borders::ALL));
+
 
             let [server_name_sect, server_avg_rt_sect, server_active_sect] = Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)]).areas(server_sect);
             let [Total_req_sect, bad_req_sect, ddos_attempt_sect] = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1), Constraint::Fill(1)]).areas(other_sect);
@@ -236,7 +257,18 @@ impl App {
 
             frame.render_widget(total_bad_l, bad_req_sect);
 
-        }else{
+        }else if (&self).screen.clone() == 1u64{
+
+            let height_bl = server_sect.height as usize - 2; // account for borders
+            let start_bl:&usize = &self.selected.saturating_sub(height_bl.saturating_sub(1));
+            let end_bl: &usize = &((start_bl + height_bl).min((&self).blocked_ips.len().clone()));
+            let visible_bl_items: Vec<_> = (&self).blocked_ips[*start_bl..*end_bl]
+                .iter()
+                .map(|i| ListItem::new(i.clone()))
+                .collect();
+
+            let list_bl = List::new(visible_bl_items)
+                .block(Block::default().borders(Borders::ALL).title("Banned IP's"));
 
             let [rps_ema_sect, rps_sect] = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).areas(other_sect);
 
@@ -245,13 +277,44 @@ impl App {
                 .block(Block::default().title("RPS Avg").borders(Borders::ALL)), rps_sect);
             frame.render_widget(Paragraph::new(Line::from(format!("{} requests/s", rps_ema.load(Ordering::SeqCst).to_string())))
                 .block(Block::default().title("RPS Avg [EMA]").borders(Borders::ALL)), rps_ema_sect);
+        }else{
+            let height_logs = server_sect.height as usize - 2; // account for borders
+            
+            let total_logs = self.logs.len();
+            let end_logs = total_logs;
+            let start_logs = end_logs.saturating_sub(height_logs);                
+            let visible_logs: Vec<_> = self.logs[start_logs..end_logs]
+                .iter()
+                .map(|i| ListItem::new(i.clone()))
+                .collect();
+                
+            let list_logs = List::new(visible_logs)
+                .block(Block::default().borders(Borders::ALL).title("Logs"));
+            let height_logs = server_sect.height as usize - 2; // account for borders
+            let start_logs:&usize = &self.selected.saturating_sub(height_logs.saturating_sub(1));
+            let end_logs: &usize = &((start_logs + height_logs).min(self.logs.len().clone()));
+            let visible_logs: Vec<_> = (&self).logs[*start_logs..*end_logs]
+                .iter()
+                .map(|i| ListItem::new(i.clone()))
+                .collect();
+
+            let list_logs = List::new(visible_logs)
+                .block(Block::default().borders(Borders::ALL).title("Logs"));
+
+
+            frame.render_widget(list_logs, server_sect); 
+
+            let [rt_avg_sect, _] = Layout::vertical([Constraint::Fill(1), Constraint::Fill(1)]).areas(other_sect);
+
+            frame.render_widget(Paragraph::new(Line::from(format!("{} ms", rt_avg.load(Ordering::SeqCst).to_string())))
+                .block(Block::default().title("Avg Res Time").borders(Borders::ALL)), rt_avg_sect);
         }
     }
 
-    fn handle_crossterm_events(&mut self) -> Result<()> {
+    async fn handle_crossterm_events(&mut self) -> Result<()> {
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key),
+                Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key_event(key).await,
                 Event::Mouse(_) => {}
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -264,13 +327,19 @@ impl App {
         self.running = false;
     }
 
-    fn on_key_event(&mut self, key: KeyEvent) {
+    async fn on_key_event(&mut self, key: KeyEvent) {
         match (key.modifiers, key.code) {
                 (KeyModifiers::CONTROL, KeyCode::Char('q')) => {
                     self.quit();
                 },
                 (_, KeyCode::Down) => {
-                    if self.selected < self.server_names.len() - 1 {
+                    if self.screen == 0 && self.selected < self.server_names.len().saturating_sub(1){
+                        self.selected += 1;
+                    }
+                    if self.screen == 1 && self.selected < self.blocked_ips.len().saturating_sub(1){
+                        self.selected += 1;
+                    }
+                    if self.screen == 2 && self.selected < self.logs.len().saturating_sub(1){
                         self.selected += 1;
                     }
                 },
@@ -281,12 +350,17 @@ impl App {
                 },
                 (_, KeyCode::Enter) => {
                     self.screen = {
-                        if self.screen == 1{
+                        if self.screen == 2{
                             0
                         }else{
                             (self.screen + 1)
                         }
                     };
+                    if self.screen == 2{
+                        self.selected = self.logs.len();
+                    }else{
+                        self.selected = 0;
+                    }
                 },
                 _ => {}
         }
@@ -311,5 +385,6 @@ fn generate_y_labels(min: f64, max: f64, count: usize) -> Vec<String> {
         .map(|i| format!("{:.0}", ( min + step * i as f64) as u64)) // ← Round to nearest int
         .collect()
 }
+
 
 

@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 type HmacSha256 = Hmac<Sha256>;
 
 mod CLIclient;
+use CLIclient::log;
 use regex::Regex;
 
 static TARGET: Lazy<Mutex<Option<Arc<Mutex<Server>>>>> = Lazy::new(|| Mutex::new(None));
@@ -499,6 +500,7 @@ enum client_type{
 
 #[tokio::main]
 async fn main() {
+    log("Starting Loadbalancer...");
 
     {
         let config = CONFIG.lock().await;
@@ -556,9 +558,11 @@ async fn main() {
                 let thresh = thresh.clone();
 
                 async move {
+                    let st = std::time::Instant::now();
                     match proxy(req, client, remote, timeout_dur.clone(), redis_conn.clone(), thresh.clone()).await {
                         Ok(response) => {
-
+                            let duration = st.elapsed();
+                            CLIclient::rt_avg_c.write().await.push(duration.as_millis() as u64);
                             Ok::<_, anyhow::Error>(response)
                         },
                         Err(err) => {
@@ -714,6 +718,8 @@ async fn main() {
             )
         };
 
+        log("Health Checks Running...");
+
         loop {
             tokio::time::sleep(Duration::from_secs(health_interval)).await;
 
@@ -743,6 +749,7 @@ async fn main() {
         CLIclient::establish().await;
     });
 
+    log("Load Balancer Running...");
     if let Err(e) = server.await {
         eprintln!("Server error: {}", e);
         panic!();
@@ -790,6 +797,8 @@ fn load_from_file(file_path: &str) -> anyhow::Result<Config> {
 
     let raw_config: RawConfig =
         serde_json::from_str(&json_data).context("Failed to deserialize JSON from file")?;
+
+    log("Loaded from config...");
 
     let servers = raw_config
         .servers
